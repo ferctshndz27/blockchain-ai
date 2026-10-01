@@ -1,0 +1,13 @@
+dependencias
+node_modules/
+pycache/
+*.pyc
+secretos
+.env
+*.key
+salida / logs
+out/
+logs/
+*.log
+sistema
+.DS_Store
