@@ -1,0 +1,279 @@
+asyncapi: 3.1.0
+info:
+  title: customer-service — eventos
+  version: 0.1.0
+  description: |
+    v0 — Hechos de clientes deudores y contactos que publica customer-service: creación y
+    actualización de clientes, fusión de duplicados y ciclo de vida de contactos
+    (alta, actualización y verificación).
+
+    - Envoltura CloudEvents 1.0 en modo binario (cabeceras `ce_*`).
+    - Key de Kafka = customerId en eventos de cliente y contactId en eventos de contacto.
+    - Publicación con outbox transaccional; consumo idempotente con inbox (`ce_id`).
+    - Sin datos personales en el payload: solo ids, estados y fechas; el valor del contacto
+      (teléfono/email) se re-sincroniza con `GET /v1/customers/{customerId}/contacts`
+      (contracts/openapi/customer-service.yaml).
+defaultContentType: application/json
+
+servers:
+  production:
+    host: kafka.receivables.internal:9098
+    protocol: kafka-secure
+    description: Kafka gestionado con TLS y autenticación IAM/SASL; ACL por servicio.
+
+channels:
+  customerEvents:
+    address: customer.events.v1
+    description: Hechos de clientes y contactos. Productor único — customer-service.
+    messages:
+      CustomerCreated:
+        $ref: '#/components/messages/CustomerCreated'
+      CustomerUpdated:
+        $ref: '#/components/messages/CustomerUpdated'
+      CustomersMerged:
+        $ref: '#/components/messages/CustomersMerged'
+      ContactAdded:
+        $ref: '#/components/messages/ContactAdded'
+      ContactUpdated:
+        $ref: '#/components/messages/ContactUpdated'
+      ContactVerified:
+        $ref: '#/components/messages/ContactVerified'
+    bindings:
+      kafka:
+        partitions: 12
+        replicas: 3
+        bindingVersion: '0.5.0'
+
+operations:
+  publishCustomerEvents:
+    action: send
+    channel:
+      $ref: '#/channels/customerEvents'
+    summary: customer-service publica los hechos de clientes y contactos mediante su outbox.
+
+components:
+  messageBindings:
+    byCustomerId:
+      kafka:
+        key:
+          type: string
+          format: uuid
+          description: customerId
+        bindingVersion: '0.5.0'
+    byContactId:
+      kafka:
+        key:
+          type: string
+          format: uuid
+          description: contactId
+        bindingVersion: '0.5.0'
+
+  messages:
+    CustomerCreated:
+      name: CustomerCreated
+      title: Cliente deudor creado
+      x-ce-type: com.receivables.customer.created.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/CustomerCreatedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byCustomerId'
+    CustomerUpdated:
+      name: CustomerUpdated
+      title: Cliente deudor actualizado
+      x-ce-type: com.receivables.customer.updated.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/CustomerUpdatedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byCustomerId'
+    CustomersMerged:
+      name: CustomersMerged
+      title: Duplicados fusionados (el destino es inmutable)
+      x-ce-type: com.receivables.customer.merged.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/CustomersMergedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byCustomerId'
+    ContactAdded:
+      name: ContactAdded
+      title: Contacto agregado al cliente
+      x-ce-type: com.receivables.customer.contact-added.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/ContactAddedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byContactId'
+    ContactUpdated:
+      name: ContactUpdated
+      title: Contacto actualizado
+      x-ce-type: com.receivables.customer.contact-updated.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/ContactUpdatedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byContactId'
+    ContactVerified:
+      name: ContactVerified
+      title: Contacto verificado (OTP, firma del proveedor o manual)
+      x-ce-type: com.receivables.customer.contact-verified.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/ContactVerifiedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byContactId'
+
+  schemas:
+    EventHeaders:
+      type: object
+      required: [ce_specversion, ce_id, ce_source, ce_type, ce_time, ce_tenantid, ce_correlationid]
+      properties:
+        ce_specversion:
+          type: string
+          const: '1.0'
+        ce_id:
+          type: string
+          format: uuid
+          description: Id único del mensaje (UUID v7); clave del inbox del consumidor.
+        ce_source:
+          type: string
+          examples: [/customer-service]
+        ce_type:
+          type: string
+          examples: [com.receivables.customer.created.v1]
+        ce_time:
+          type: string
+          format: date-time
+        ce_subject:
+          type: string
+          examples: [customer/0192f5d2-7c1a-7b3e-9f10-2a6c1d4e8b90]
+        ce_tenantid:
+          type: string
+          format: uuid
+        ce_correlationid:
+          type: string
+          description: Agrupa todos los mensajes de un mismo flujo.
+        ce_causationid:
+          type: string
+          description: ce_id del mensaje que causó este.
+        traceparent:
+          type: string
+          description: Contexto W3C Trace Context.
+        content-type:
+          type: string
+          const: application/json
+    Uuid:
+      type: string
+      format: uuid
+    Channel:
+      type: string
+      enum: [WHATSAPP, PHONE, EMAIL, MESSENGER, IN_APP]
+      description: Coincide letra por letra con el enum channel de los schemas Contact de contracts/openapi/customer-service.yaml.
+    VerificationStatus:
+      type: string
+      enum: [UNVERIFIED, PENDING, VERIFIED, FAILED]
+      description: Coincide letra por letra con el enum verificationStatus de los schemas Contact de contracts/openapi/customer-service.yaml.
+    CustomerVersion:
+      type: integer
+      minimum: 1
+      description: Versión del cliente después del cambio.
+
+    CustomerCreatedPayload:
+      type: object
+      additionalProperties: false
+      required: [customerId, version, createdAt]
+      properties:
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        segment:
+          type: string
+        version:
+          $ref: '#/components/schemas/CustomerVersion'
+        createdAt:
+          type: string
+          format: date-time
+    CustomerUpdatedPayload:
+      type: object
+      additionalProperties: false
+      required: [customerId, version, updatedAt]
+      properties:
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        segment:
+          type: string
+        version:
+          $ref: '#/components/schemas/CustomerVersion'
+        updatedAt:
+          type: string
+          format: date-time
+    CustomersMergedPayload:
+      type: object
+      additionalProperties: false
+      required: [customerId, sourceCustomerId, version, mergedAt]
+      properties:
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+          description: Cliente destino de la fusión.
+        sourceCustomerId:
+          $ref: '#/components/schemas/Uuid'
+          description: Cliente fusionado (deja de ser consultable como activo).
+        version:
+          $ref: '#/components/schemas/CustomerVersion'
+        mergedAt:
+          type: string
+          format: date-time
+    ContactAddedPayload:
+      type: object
+      additionalProperties: false
+      required: [contactId, customerId, channel, verificationStatus, addedAt]
+      properties:
+        contactId:
+          $ref: '#/components/schemas/Uuid'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        channel:
+          $ref: '#/components/schemas/Channel'
+        verificationStatus:
+          $ref: '#/components/schemas/VerificationStatus'
+        addedAt:
+          type: string
+          format: date-time
+    ContactUpdatedPayload:
+      type: object
+      additionalProperties: false
+      required: [contactId, customerId, channel, verificationStatus, updatedAt]
+      properties:
+        contactId:
+          $ref: '#/components/schemas/Uuid'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        channel:
+          $ref: '#/components/schemas/Channel'
+        verificationStatus:
+          $ref: '#/components/schemas/VerificationStatus'
+        updatedAt:
+          type: string
+          format: date-time
+    ContactVerifiedPayload:
+      type: object
+      additionalProperties: false
+      required: [contactId, customerId, channel, verificationStatus, verifiedAt]
+      properties:
+        contactId:
+          $ref: '#/components/schemas/Uuid'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        channel:
+          $ref: '#/components/schemas/Channel'
+        verificationStatus:
+          $ref: '#/components/schemas/VerificationStatus'
+        verifiedAt:
+          type: string
+          format: date-time

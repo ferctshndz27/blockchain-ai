@@ -1,0 +1,715 @@
+asyncapi: 3.1.0
+info:
+  title: case-service — eventos y comandos
+  version: 1.0.0
+  description: |
+    Eventos del agregado Case, comandos que acepta case-service y comandos que emite al aplicar una
+    decisión del agente (siempre con permiso firmado).
+
+    - Envoltura CloudEvents 1.0 en modo binario (cabeceras `ce_*`).
+    - Key de Kafka = caseId: orden garantizado por caso dentro de cada topic.
+    - Publicación con outbox transaccional; consumo idempotente con inbox (`ce_id`).
+    - Los consumidores comparan `aggregateVersion` y, ante un hueco, se re-sincronizan con
+      `GET /v1/cases/{caseId}` (contracts/openapi/case-service.yaml).
+defaultContentType: application/json
+
+servers:
+  production:
+    host: kafka.receivables.internal:9098
+    protocol: kafka-secure
+    description: Kafka gestionado con TLS y autenticación IAM/SASL; ACL por servicio.
+
+channels:
+  caseEvents:
+    address: case.events.v1
+    description: Hechos del agregado Case. Productor único - case-service.
+    messages:
+      CaseOpened:
+        $ref: '#/components/messages/CaseOpened'
+      CaseTransitioned:
+        $ref: '#/components/messages/CaseTransitioned'
+      CasePaused:
+        $ref: '#/components/messages/CasePaused'
+      CaseResumed:
+        $ref: '#/components/messages/CaseResumed'
+      CaseTakeoverStarted:
+        $ref: '#/components/messages/CaseTakeoverStarted'
+      CaseTakeoverEnded:
+        $ref: '#/components/messages/CaseTakeoverEnded'
+      CaseNextActionDue:
+        $ref: '#/components/messages/CaseNextActionDue'
+      CaseClosed:
+        $ref: '#/components/messages/CaseClosed'
+      AgentDecisionApplied:
+        $ref: '#/components/messages/AgentDecisionApplied'
+      CommandRejected:
+        $ref: '#/components/messages/CommandRejected'
+    bindings:
+      kafka:
+        partitions: 12
+        replicas: 3
+        bindingVersion: '0.5.0'
+
+  caseCommands:
+    address: case.commands.v1
+    description: Comandos dirigidos a case-service. Productor - agent-service.
+    messages:
+      ApplyAgentDecision:
+        $ref: '#/components/messages/ApplyAgentDecision'
+    bindings:
+      kafka:
+        partitions: 12
+        replicas: 3
+        bindingVersion: '0.5.0'
+
+  conversationCommands:
+    address: conversation.commands.v1
+    description: Propiedad de conversation-service. case-service produce SendMessage.
+    messages:
+      SendMessage:
+        $ref: '#/components/messages/SendMessage'
+
+  agreementCommands:
+    address: agreement.commands.v1
+    description: Propiedad de agreement-service. case-service produce ProposePromise y ConfirmPromise.
+    messages:
+      ProposePromise:
+        $ref: '#/components/messages/ProposePromise'
+      ConfirmPromise:
+        $ref: '#/components/messages/ConfirmPromise'
+
+operations:
+  publishCaseEvents:
+    action: send
+    channel:
+      $ref: '#/channels/caseEvents'
+    summary: case-service publica los hechos del caso mediante su outbox.
+
+  receiveCaseCommands:
+    action: receive
+    channel:
+      $ref: '#/channels/caseCommands'
+    summary: |
+      Aplica una decisión del agente. Si el comando venció (expiresAt), si la versión del caso no es
+      expectedVersion o si el estado no la admite, publica CommandRejected y no ejecuta ninguna acción
+      (todas o ninguna). Las acciones que dependen de otra (un mensaje que confirma una promesa) se
+      emiten cuando llega la confirmación de la primera (PromiseProposed).
+    bindings:
+      kafka:
+        groupId:
+          type: string
+          enum: [case-service]
+        bindingVersion: '0.5.0'
+
+  sendConversationCommands:
+    action: send
+    channel:
+      $ref: '#/channels/conversationCommands'
+    summary: Pide a conversation-service enviar un mensaje con permiso firmado.
+
+  sendAgreementCommands:
+    action: send
+    channel:
+      $ref: '#/channels/agreementCommands'
+    summary: Pide a agreement-service proponer o confirmar una promesa con permiso firmado.
+
+components:
+  messageBindings:
+    byCaseId:
+      kafka:
+        key:
+          type: string
+          format: uuid
+          description: caseId
+        bindingVersion: '0.5.0'
+
+  messages:
+    CaseOpened:
+      name: CaseOpened
+      title: Caso abierto
+      x-ce-type: com.receivables.case.opened.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/CaseOpenedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byCaseId'
+    CaseTransitioned:
+      name: CaseTransitioned
+      title: Cambio de estado del caso
+      x-ce-type: com.receivables.case.transitioned.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/CaseTransitionedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byCaseId'
+    CasePaused:
+      name: CasePaused
+      title: Cobranza pausada (caso completo o algunas facturas)
+      x-ce-type: com.receivables.case.paused.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/CasePausedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byCaseId'
+    CaseResumed:
+      name: CaseResumed
+      title: Cobranza reanudada
+      x-ce-type: com.receivables.case.resumed.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/ActorEventPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byCaseId'
+    CaseTakeoverStarted:
+      name: CaseTakeoverStarted
+      title: Una persona tomó el control de la conversación
+      x-ce-type: com.receivables.case.takeover-started.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/ActorEventPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byCaseId'
+    CaseTakeoverEnded:
+      name: CaseTakeoverEnded
+      title: El control volvió al agente
+      x-ce-type: com.receivables.case.takeover-ended.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/ActorEventPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byCaseId'
+    CaseNextActionDue:
+      name: CaseNextActionDue
+      title: Venció la próxima acción programada
+      x-ce-type: com.receivables.case.next-action-due.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/CaseNextActionDuePayload'
+      bindings:
+        $ref: '#/components/messageBindings/byCaseId'
+    CaseClosed:
+      name: CaseClosed
+      title: Caso cerrado
+      x-ce-type: com.receivables.case.closed.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/CaseClosedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byCaseId'
+    AgentDecisionApplied:
+      name: AgentDecisionApplied
+      title: Decisión del agente aplicada
+      x-ce-type: com.receivables.case.agent-decision-applied.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/AgentDecisionAppliedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byCaseId'
+    CommandRejected:
+      name: CommandRejected
+      title: Comando rechazado
+      x-ce-type: com.receivables.case.command-rejected.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/CommandRejectedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byCaseId'
+
+    ApplyAgentDecision:
+      name: ApplyAgentDecision
+      title: Aplicar las acciones de un turno del agente
+      summary: Todas las acciones del turno juntas; se aplican todas o ninguna.
+      x-ce-type: com.receivables.case.apply-agent-decision.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/ApplyAgentDecisionPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byCaseId'
+    SendMessage:
+      name: SendMessage
+      title: Enviar un mensaje al contacto del caso
+      x-ce-type: com.receivables.conversation.send-message.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/SendMessagePayload'
+      bindings:
+        $ref: '#/components/messageBindings/byCaseId'
+    ProposePromise:
+      name: ProposePromise
+      title: Registrar una promesa de pago propuesta
+      x-ce-type: com.receivables.agreement.propose-promise.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/ProposePromisePayload'
+      bindings:
+        $ref: '#/components/messageBindings/byCaseId'
+    ConfirmPromise:
+      name: ConfirmPromise
+      title: Confirmar una promesa tras la confirmación explícita del cliente
+      x-ce-type: com.receivables.agreement.confirm-promise.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/ConfirmPromisePayload'
+      bindings:
+        $ref: '#/components/messageBindings/byCaseId'
+
+  schemas:
+    EventHeaders:
+      type: object
+      required: [ce_specversion, ce_id, ce_source, ce_type, ce_time, ce_tenantid, ce_correlationid]
+      properties:
+        ce_specversion:
+          type: string
+          const: '1.0'
+        ce_id:
+          type: string
+          format: uuid
+          description: Id único del mensaje (UUID v7); clave del inbox del consumidor.
+        ce_source:
+          type: string
+          examples: [/case-service]
+        ce_type:
+          type: string
+          examples: [com.receivables.case.transitioned.v1]
+        ce_time:
+          type: string
+          format: date-time
+        ce_subject:
+          type: string
+          examples: [case/0192f5d2-7c1a-7b3e-9f10-2a6c1d4e8b90]
+        ce_tenantid:
+          type: string
+          format: uuid
+        ce_correlationid:
+          type: string
+          description: Agrupa todos los mensajes de un mismo flujo (p. ej. un mensaje entrante).
+        ce_causationid:
+          type: string
+          description: ce_id del mensaje que causó este.
+        traceparent:
+          type: string
+          description: Contexto W3C Trace Context.
+        content-type:
+          type: string
+          const: application/json
+
+    Uuid:
+      type: string
+      format: uuid
+    AggregateVersion:
+      type: integer
+      minimum: 1
+      description: Versión del caso después del cambio.
+    Money:
+      type: object
+      additionalProperties: false
+      required: [amount, currency]
+      properties:
+        amount:
+          type: string
+          pattern: '^-?\d{1,15}(\.\d{1,4})?$'
+          description: Decimal exacto como cadena.
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+    Actor:
+      type: object
+      additionalProperties: false
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [HUMAN, AI, SYSTEM]
+        id:
+          type: string
+    CaseStatus:
+      type: string
+      enum: [NEW, OUTREACH, AWAITING_REPLY, NEGOTIATING, PROMISE_ACTIVE, PLAN_ACTIVE, DISPUTED, ESCALATED, RESOLVED, CLOSED]
+    CloseReason:
+      type: string
+      enum: [PAID, CREDITED, WRITTEN_OFF, CANCELLED, UNCOLLECTIBLE]
+    PauseReason:
+      type: string
+      enum: [DISPUTE, CUSTOMER_REQUEST, INTERNAL_REVIEW, OTHER]
+    EscalationReason:
+      type: string
+      enum: [LEGAL_THREAT, COMPLAINT, HUMAN_REQUEST, POLICY_EXCEPTION, OTHER]
+    Channel:
+      type: string
+      enum: [WHATSAPP, EMAIL]
+    FactRef:
+      type: object
+      additionalProperties: false
+      description: Dato autoritativo insertado en el mensaje por código (no por el LLM), con su origen.
+      required: [source, id, version]
+      properties:
+        source:
+          type: string
+          enum: [LEDGER_BALANCE, INVOICE, PAYMENT_LINK, PROMISE]
+        id:
+          $ref: '#/components/schemas/Uuid'
+        version:
+          type: integer
+          minimum: 1
+
+    CaseOpenedPayload:
+      type: object
+      additionalProperties: false
+      required: [caseId, aggregateVersion, customerId, invoiceIds, autonomyLevel, openedAt]
+      properties:
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        aggregateVersion:
+          $ref: '#/components/schemas/AggregateVersion'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        invoiceIds:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/Uuid'
+        autonomyLevel:
+          type: string
+          enum: [L0, L1, L2, L3]
+        openedAt:
+          type: string
+          format: date-time
+    CaseTransitionedPayload:
+      type: object
+      additionalProperties: false
+      required: [caseId, aggregateVersion, from, to, reason, actor]
+      properties:
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        aggregateVersion:
+          $ref: '#/components/schemas/AggregateVersion'
+        from:
+          $ref: '#/components/schemas/CaseStatus'
+        to:
+          $ref: '#/components/schemas/CaseStatus'
+        reason:
+          type: string
+          examples: [PROMISE_CONFIRMED]
+        actor:
+          $ref: '#/components/schemas/Actor'
+    CasePausedPayload:
+      type: object
+      additionalProperties: false
+      required: [caseId, aggregateVersion, reason, invoiceIds, actor]
+      properties:
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        aggregateVersion:
+          $ref: '#/components/schemas/AggregateVersion'
+        reason:
+          $ref: '#/components/schemas/PauseReason'
+        invoiceIds:
+          type: array
+          description: Facturas pausadas; vacío significa todo el caso.
+          items:
+            $ref: '#/components/schemas/Uuid'
+        until:
+          type: [string, 'null']
+          format: date-time
+        actor:
+          $ref: '#/components/schemas/Actor'
+    ActorEventPayload:
+      type: object
+      additionalProperties: false
+      required: [caseId, aggregateVersion, actor]
+      properties:
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        aggregateVersion:
+          $ref: '#/components/schemas/AggregateVersion'
+        actor:
+          $ref: '#/components/schemas/Actor'
+    CaseNextActionDuePayload:
+      type: object
+      additionalProperties: false
+      required: [caseId, aggregateVersion, actionType, dueAt]
+      properties:
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        aggregateVersion:
+          $ref: '#/components/schemas/AggregateVersion'
+        actionType:
+          type: string
+          examples: [REQUEST_PAYMENT_DATE]
+        dueAt:
+          type: string
+          format: date-time
+    CaseClosedPayload:
+      type: object
+      additionalProperties: false
+      required: [caseId, aggregateVersion, closeReason]
+      properties:
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        aggregateVersion:
+          $ref: '#/components/schemas/AggregateVersion'
+        closeReason:
+          $ref: '#/components/schemas/CloseReason'
+    AgentDecisionAppliedPayload:
+      type: object
+      additionalProperties: false
+      required: [caseId, aggregateVersion, commandId, turnId, appliedActions]
+      properties:
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        aggregateVersion:
+          $ref: '#/components/schemas/AggregateVersion'
+        commandId:
+          $ref: '#/components/schemas/Uuid'
+        turnId:
+          $ref: '#/components/schemas/Uuid'
+        appliedActions:
+          type: array
+          items:
+            type: string
+            enum: [SEND_MESSAGE, PROPOSE_PROMISE, CONFIRM_PROMISE, ESCALATE, MARK_DISPUTE]
+    CommandRejectedPayload:
+      type: object
+      additionalProperties: false
+      required: [caseId, commandId, commandType, reason, currentVersion]
+      properties:
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        commandId:
+          $ref: '#/components/schemas/Uuid'
+        commandType:
+          type: string
+          examples: [ApplyAgentDecision]
+        reason:
+          type: string
+          enum: [EXPIRED, STALE_VERSION, ILLEGAL_TRANSITION, CASE_PAUSED, TAKEOVER_ACTIVE, CASE_CLOSED, VALIDATION_FAILED]
+        currentVersion:
+          type: integer
+          minimum: 1
+        detail:
+          type: string
+
+    ApplyAgentDecisionPayload:
+      type: object
+      additionalProperties: false
+      required: [commandId, turnId, caseId, expectedVersion, expiresAt, policyVersion, intents, actions]
+      properties:
+        commandId:
+          $ref: '#/components/schemas/Uuid'
+        turnId:
+          $ref: '#/components/schemas/Uuid'
+        expiresAt:
+          type: string
+          format: date-time
+          description: Vencimiento del comando (por defecto, emisión + 2 min). Si llega después, se rechaza con EXPIRED.
+        proposalId:
+          type: [string, 'null']
+          format: uuid
+          description: Presente si la decisión viene de una propuesta aprobada por una persona.
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        expectedVersion:
+          type: integer
+          minimum: 1
+          description: Versión del caso con la que el agente construyó su contexto.
+        policyVersion:
+          type: integer
+          minimum: 1
+        intents:
+          type: array
+          items:
+            type: string
+            enum: [PAYMENT_INTENT, PAYMENT_NEGOTIATION, PAYMENT_PROMISE, PAYMENT_CLAIMED, DISPUTE, REQUEST_DOCUMENT,
+                   QUESTION, IDENTITY_CLARIFICATION, OPT_OUT, HUMAN_REQUEST, LEGAL_THREAT_OR_COMPLAINT, OTHER]
+        actions:
+          type: array
+          minItems: 1
+          maxItems: 5
+          items:
+            oneOf:
+              - $ref: '#/components/schemas/SendMessageAction'
+              - $ref: '#/components/schemas/ProposePromiseAction'
+              - $ref: '#/components/schemas/ConfirmPromiseAction'
+              - $ref: '#/components/schemas/EscalateAction'
+              - $ref: '#/components/schemas/MarkDisputeAction'
+    SendMessageAction:
+      type: object
+      additionalProperties: false
+      required: [type, contactId, channel, factsRefs]
+      properties:
+        type:
+          type: string
+          const: SEND_MESSAGE
+        contactId:
+          $ref: '#/components/schemas/Uuid'
+        channel:
+          $ref: '#/components/schemas/Channel'
+        templateKey:
+          type: [string, 'null']
+          description: Plantilla aprobada; obligatoria fuera de la ventana de 24 h de WhatsApp.
+        body:
+          type: [string, 'null']
+          maxLength: 4096
+          description: Texto ya renderizado. Cifras, folios y links los inserta el código, nunca el LLM.
+        factsRefs:
+          type: array
+          items:
+            $ref: '#/components/schemas/FactRef'
+    ProposePromiseAction:
+      type: object
+      additionalProperties: false
+      required: [type, amount, promisedDate, invoiceIds, sourceMessageId]
+      properties:
+        type:
+          type: string
+          const: PROPOSE_PROMISE
+        amount:
+          $ref: '#/components/schemas/Money'
+        promisedDate:
+          type: string
+          format: date
+        invoiceIds:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/Uuid'
+        sourceMessageId:
+          $ref: '#/components/schemas/Uuid'
+    ConfirmPromiseAction:
+      type: object
+      additionalProperties: false
+      required: [type, promiseId, confirmationMessageId]
+      properties:
+        type:
+          type: string
+          const: CONFIRM_PROMISE
+        promiseId:
+          $ref: '#/components/schemas/Uuid'
+        confirmationMessageId:
+          $ref: '#/components/schemas/Uuid'
+    EscalateAction:
+      type: object
+      additionalProperties: false
+      required: [type, reason]
+      properties:
+        type:
+          type: string
+          const: ESCALATE
+        reason:
+          $ref: '#/components/schemas/EscalationReason'
+        note:
+          type: string
+          maxLength: 2000
+    MarkDisputeAction:
+      type: object
+      additionalProperties: false
+      required: [type, disputeType, invoiceIds, sourceMessageId, summary]
+      properties:
+        type:
+          type: string
+          const: MARK_DISPUTE
+        disputeType:
+          type: string
+          enum: [WRONG_AMOUNT, QUANTITY_MISMATCH, WRONG_PRODUCT, SERVICE_NOT_DELIVERED, DUPLICATE_INVOICE,
+                 MISSING_DOCUMENT, CONTRACT_DISPUTE, OTHER]
+        invoiceIds:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/Uuid'
+        sourceMessageId:
+          $ref: '#/components/schemas/Uuid'
+        summary:
+          type: string
+          maxLength: 1000
+
+    SendMessagePayload:
+      type: object
+      additionalProperties: false
+      description: commandId es también la clave de idempotencia del envío (client_ref ante el proveedor).
+      required: [commandId, caseId, permit, contactId, channel, factsRefs]
+      properties:
+        commandId:
+          $ref: '#/components/schemas/Uuid'
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        turnId:
+          type: [string, 'null']
+          format: uuid
+        permit:
+          type: string
+          description: JWS de case-service (scope SEND_MESSAGE, 60 s). conversation-service lo verifica antes de enviar.
+        contactId:
+          $ref: '#/components/schemas/Uuid'
+        channel:
+          $ref: '#/components/schemas/Channel'
+        templateKey:
+          type: [string, 'null']
+        templateParams:
+          type: object
+          additionalProperties:
+            type: string
+        body:
+          type: [string, 'null']
+          maxLength: 4096
+        factsRefs:
+          type: array
+          items:
+            $ref: '#/components/schemas/FactRef'
+    ProposePromisePayload:
+      type: object
+      additionalProperties: false
+      required: [commandId, caseId, permit, amount, promisedDate, invoiceIds, sourceMessageId]
+      properties:
+        commandId:
+          $ref: '#/components/schemas/Uuid'
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        turnId:
+          type: [string, 'null']
+          format: uuid
+        permit:
+          type: string
+          description: JWS de case-service (scope PROPOSE_PROMISE).
+        amount:
+          $ref: '#/components/schemas/Money'
+        promisedDate:
+          type: string
+          format: date
+        invoiceIds:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/Uuid'
+        sourceMessageId:
+          $ref: '#/components/schemas/Uuid'
+    ConfirmPromisePayload:
+      type: object
+      additionalProperties: false
+      required: [commandId, caseId, permit, promiseId, confirmationMessageId]
+      properties:
+        commandId:
+          $ref: '#/components/schemas/Uuid'
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        permit:
+          type: string
+          description: JWS de case-service (scope CONFIRM_PROMISE).
+        promiseId:
+          $ref: '#/components/schemas/Uuid'
+        confirmationMessageId:
+          $ref: '#/components/schemas/Uuid'

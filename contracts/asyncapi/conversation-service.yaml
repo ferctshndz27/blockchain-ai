@@ -1,0 +1,760 @@
+asyncapi: 3.1.0
+info:
+  title: conversation-service — eventos y comandos
+  version: 0.1.0
+  description: |
+    v0 — Hechos de conversaciones y mensajes (sin el cuerpo), ciclo de opt-out por canal,
+    mensajes entrantes sin enrutar y rechazo de comandos. Acepta el comando SendMessage
+    (con permiso firmado de case-service). Consume los webhooks crudos de WhatsApp y email
+    publicados por webhook-ingress, y las pausas/takeover de case-service para pausar el
+    envío localmente.
+
+    - Envoltura CloudEvents 1.0 en modo binario (cabeceras `ce_*`).
+    - Key de Kafka = conversationId para eventos de mensaje, contactId para opt-out/in,
+      caseId para eventos consumidos del caso y CommandRejected, providerEventId en los
+      topics de ingreso, providerMessageId para InboundUnrouted.
+    - Publicación con outbox transaccional; consumo idempotente con inbox (`ce_id`) y, en
+      el ingreso, UNIQUE (provider, provider_event_id).
+    - El cuerpo del mensaje nunca viaja en el evento (claim check): se recupera con
+      `GET /internal/v1/messages/{messageId}` (contracts/openapi/conversation-service.yaml).
+    - El opt-out por canal vive aquí: se recibe por el canal y se aplica al enviar.
+defaultContentType: application/json
+
+servers:
+  production:
+    host: kafka.receivables.internal:9098
+    protocol: kafka-secure
+    description: Kafka gestionado con TLS y autenticación IAM/SASL; ACL por servicio.
+
+channels:
+  conversationEvents:
+    address: conversation.events.v1
+    description: Hechos de mensajes, opt-out e inbound sin enrutar. Productor único — conversation-service.
+    messages:
+      MessageReceived:
+        $ref: '#/components/messages/MessageReceived'
+      MessageSent:
+        $ref: '#/components/messages/MessageSent'
+      MessageDelivered:
+        $ref: '#/components/messages/MessageDelivered'
+      MessageRead:
+        $ref: '#/components/messages/MessageRead'
+      MessageFailed:
+        $ref: '#/components/messages/MessageFailed'
+      MessageDeliveryUnknown:
+        $ref: '#/components/messages/MessageDeliveryUnknown'
+      ContactOptedOut:
+        $ref: '#/components/messages/ContactOptedOut'
+      ContactOptedIn:
+        $ref: '#/components/messages/ContactOptedIn'
+      InboundUnrouted:
+        $ref: '#/components/messages/InboundUnrouted'
+      CommandRejected:
+        $ref: '#/components/messages/CommandRejected'
+    bindings:
+      kafka:
+        partitions: 12
+        replicas: 3
+        bindingVersion: '0.5.0'
+
+  conversationCommands:
+    address: conversation.commands.v1
+    description: Comandos dirigidos a conversation-service. Productor — case-service.
+    messages:
+      SendMessage:
+        $ref: '#/components/messages/SendMessage'
+    bindings:
+      kafka:
+        partitions: 12
+        replicas: 3
+        bindingVersion: '0.5.0'
+
+  caseEvents:
+    address: case.events.v1
+    description: Propiedad de case-service. conversation-service consume pausas y takeover para pausar el envío localmente.
+    messages:
+      CasePaused:
+        $ref: '#/components/messages/CasePaused'
+      CaseResumed:
+        $ref: '#/components/messages/CaseResumed'
+      CaseTakeoverStarted:
+        $ref: '#/components/messages/CaseTakeoverStarted'
+      CaseTakeoverEnded:
+        $ref: '#/components/messages/CaseTakeoverEnded'
+
+  whatsappIngress:
+    address: ingress.whatsapp.v1
+    description: Webhooks crudos de WhatsApp (payload del proveedor, retención 3 días). Productor — webhook-ingress; ACL solo para conversation-service.
+    messages:
+      WhatsappIngress:
+        $ref: '#/components/messages/WhatsappIngress'
+    bindings:
+      kafka:
+        partitions: 12
+        replicas: 3
+        bindingVersion: '0.5.0'
+
+  emailIngress:
+    address: ingress.email.v1
+    description: Webhooks crudos de email (payload del proveedor, retención 3 días). Productor — webhook-ingress; ACL solo para conversation-service.
+    messages:
+      EmailIngress:
+        $ref: '#/components/messages/EmailIngress'
+    bindings:
+      kafka:
+        partitions: 12
+        replicas: 3
+        bindingVersion: '0.5.0'
+
+operations:
+  publishConversationEvents:
+    action: send
+    channel:
+      $ref: '#/channels/conversationEvents'
+    summary: conversation-service publica los hechos de mensajes y opt-out mediante su outbox.
+
+  receiveConversationCommands:
+    action: receive
+    channel:
+      $ref: '#/channels/conversationCommands'
+    summary: |
+      Envía un mensaje al contacto del caso. Verifica el permiso firmado (JWS de case-service),
+      la ventana de 24 h, el opt-out por canal y el estado de takeover/pausa. Si no cumple,
+      publica CommandRejected y no envía. El envío es idempotente por commandId.
+    bindings:
+      kafka:
+        groupId:
+          type: string
+          enum: [conversation-service]
+        bindingVersion: '0.5.0'
+
+  receiveCaseEvents:
+    action: receive
+    channel:
+      $ref: '#/channels/caseEvents'
+    summary: |
+      Mantiene la proyección local de pausa y takeover por caso. CasePaused y CaseTakeoverStarted
+      bloquean el envío saliente para ese caso; CaseResumed y CaseTakeoverEnded lo desbloquean.
+    bindings:
+      kafka:
+        groupId:
+          type: string
+          enum: [conversation-service]
+        bindingVersion: '0.5.0'
+
+  receiveWhatsappIngress:
+    action: receive
+    channel:
+      $ref: '#/channels/whatsappIngress'
+    summary: |
+      Verifica la firma sobre el cuerpo crudo, resuelve el tenant vía cuenta de canal (§7.6),
+      enruta el mensaje a la conversación (o publica InboundUnrouted si no hay cuenta),
+      registra el mensaje entrante y publica MessageReceived (sin cuerpo). Detecta opt-out
+      (keyword STOP) y publica ContactOptedOut.
+    bindings:
+      kafka:
+        groupId:
+          type: string
+          enum: [conversation-service]
+        bindingVersion: '0.5.0'
+
+  receiveEmailIngress:
+    action: receive
+    channel:
+      $ref: '#/channels/emailIngress'
+    summary: |
+      Verifica la firma sobre el cuerpo crudo, resuelve el tenant vía cuenta de canal (§7.6),
+      enruta el mensaje a la conversación (o publica InboundUnrouted si no hay cuenta),
+      registra el mensaje entrante y publica MessageReceived (sin cuerpo). Detecta opt-out
+      (unsubscribe) y publica ContactOptedOut.
+    bindings:
+      kafka:
+        groupId:
+          type: string
+          enum: [conversation-service]
+        bindingVersion: '0.5.0'
+
+components:
+  messageBindings:
+    byConversationId:
+      kafka:
+        key:
+          type: string
+          format: uuid
+          description: conversationId
+        bindingVersion: '0.5.0'
+    byContactId:
+      kafka:
+        key:
+          type: string
+          format: uuid
+          description: contactId
+        bindingVersion: '0.5.0'
+    byCaseId:
+      kafka:
+        key:
+          type: string
+          format: uuid
+          description: caseId
+        bindingVersion: '0.5.0'
+    byProviderEventId:
+      kafka:
+        key:
+          type: string
+          description: providerEventId
+        bindingVersion: '0.5.0'
+    byProviderMessageId:
+      kafka:
+        key:
+          type: string
+          description: providerMessageId
+        bindingVersion: '0.5.0'
+
+  messages:
+    MessageReceived:
+      name: MessageReceived
+      title: Mensaje entrante registrado (sin cuerpo)
+      x-ce-type: com.receivables.conversation.message-received.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/MessageReceivedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byConversationId'
+    MessageSent:
+      name: MessageSent
+      title: Mensaje saliente enviado al proveedor
+      x-ce-type: com.receivables.conversation.message-sent.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/MessageSentPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byConversationId'
+    MessageDelivered:
+      name: MessageDelivered
+      title: Mensaje entregado (confirmación del proveedor)
+      x-ce-type: com.receivables.conversation.message-delivered.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/MessageDeliveredPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byConversationId'
+    MessageRead:
+      name: MessageRead
+      title: Mensaje leído (confirmación del proveedor)
+      x-ce-type: com.receivables.conversation.message-read.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/MessageReadPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byConversationId'
+    MessageFailed:
+      name: MessageFailed
+      title: Envío fallido (error del proveedor)
+      x-ce-type: com.receivables.conversation.message-failed.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/MessageFailedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byConversationId'
+    MessageDeliveryUnknown:
+      name: MessageDeliveryUnknown
+      title: Estado de entrega indeterminado (timeout del proveedor)
+      x-ce-type: com.receivables.conversation.message-delivery-unknown.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/MessageDeliveryUnknownPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byConversationId'
+    ContactOptedOut:
+      name: ContactOptedOut
+      title: Contacto optó fuera del canal
+      x-ce-type: com.receivables.conversation.contact-opted-out.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/ContactOptedOutPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byContactId'
+    ContactOptedIn:
+      name: ContactOptedIn
+      title: Contacto revirtió el opt-out del canal
+      x-ce-type: com.receivables.conversation.contact-opted-in.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/ContactOptedInPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byContactId'
+    InboundUnrouted:
+      name: InboundUnrouted
+      title: Mensaje entrante sin cuenta de canal asociada
+      x-ce-type: com.receivables.conversation.inbound-unrouted.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/InboundUnroutedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byProviderMessageId'
+    CommandRejected:
+      name: CommandRejected
+      title: Comando de conversación rechazado
+      x-ce-type: com.receivables.conversation.command-rejected.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/CommandRejectedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byCaseId'
+
+    SendMessage:
+      name: SendMessage
+      title: Enviar un mensaje al contacto del caso
+      summary: commandId es la clave de idempotencia del envío.
+      x-ce-type: com.receivables.conversation.send-message.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/SendMessagePayload'
+      bindings:
+        $ref: '#/components/messageBindings/byCaseId'
+
+    CasePaused:
+      name: CasePaused
+      title: Cobranza pausada (propiedad de case-service)
+      x-ce-type: com.receivables.case.paused.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/CasePausedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byCaseId'
+    CaseResumed:
+      name: CaseResumed
+      title: Cobranza reanudada (propiedad de case-service)
+      x-ce-type: com.receivables.case.resumed.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/CaseResumedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byCaseId'
+    CaseTakeoverStarted:
+      name: CaseTakeoverStarted
+      title: Una persona tomó el control (propiedad de case-service)
+      x-ce-type: com.receivables.case.takeover-started.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/CaseTakeoverStartedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byCaseId'
+    CaseTakeoverEnded:
+      name: CaseTakeoverEnded
+      title: El control volvió al agente (propiedad de case-service)
+      x-ce-type: com.receivables.case.takeover-ended.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/CaseTakeoverEndedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byCaseId'
+
+    WhatsappIngress:
+      name: WhatsappIngress
+      title: Webhook crudo de WhatsApp (propiedad de webhook-ingress)
+      x-ce-type: com.receivables.ingress.whatsapp.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/WhatsappIngressPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byProviderEventId'
+    EmailIngress:
+      name: EmailIngress
+      title: Webhook crudo de email (propiedad de webhook-ingress)
+      x-ce-type: com.receivables.ingress.email.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/EmailIngressPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byProviderEventId'
+
+  schemas:
+    EventHeaders:
+      type: object
+      required: [ce_specversion, ce_id, ce_source, ce_type, ce_time, ce_tenantid, ce_correlationid]
+      properties:
+        ce_specversion:
+          type: string
+          const: '1.0'
+        ce_id:
+          type: string
+          format: uuid
+          description: Id único del mensaje (UUID v7); clave del inbox del consumidor.
+        ce_source:
+          type: string
+          examples: [/conversation-service]
+        ce_type:
+          type: string
+          examples: [com.receivables.conversation.message-received.v1]
+        ce_time:
+          type: string
+          format: date-time
+        ce_subject:
+          type: string
+          examples: [conversation/0192f5d2-7c1a-7b3e-9f10-2a6c1d4e8b90]
+        ce_tenantid:
+          type: string
+          format: uuid
+        ce_correlationid:
+          type: string
+          description: Agrupa todos los mensajes de un mismo flujo (p. ej. un mensaje entrante y sus respuestas).
+        ce_causationid:
+          type: string
+          description: ce_id del mensaje que causó este.
+        traceparent:
+          type: string
+          description: Contexto W3C Trace Context.
+        content-type:
+          type: string
+          const: application/json
+    Uuid:
+      type: string
+      format: uuid
+    Channel:
+      type: string
+      enum: [WHATSAPP, PHONE, EMAIL, MESSENGER, IN_APP]
+      description: Coincide letra por letra con el enum channel de los schemas Message y Conversation de contracts/openapi/conversation-service.yaml.
+    MessageDirection:
+      type: string
+      enum: [INBOUND, OUTBOUND, INTERNAL]
+      description: Coincide letra por letra con el enum direction del schema Message de contracts/openapi/conversation-service.yaml.
+    Actor:
+      type: object
+      additionalProperties: false
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [HUMAN, AI, SYSTEM]
+        id:
+          type: string
+    PauseReason:
+      type: string
+      enum: [DISPUTE, CUSTOMER_REQUEST, INTERNAL_REVIEW, OTHER]
+      description: Coincide letra por letra con el enum PauseReason de contracts/asyncapi/case-service.yaml.
+    AggregateVersion:
+      type: integer
+      minimum: 1
+      description: Versión del caso después del cambio.
+
+    MessageReceivedPayload:
+      type: object
+      additionalProperties: false
+      required: [messageId, conversationId, caseId, contactId, channel, direction, providerMessageId, receivedAt]
+      properties:
+        messageId:
+          $ref: '#/components/schemas/Uuid'
+        conversationId:
+          $ref: '#/components/schemas/Uuid'
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        contactId:
+          $ref: '#/components/schemas/Uuid'
+        channel:
+          $ref: '#/components/schemas/Channel'
+        direction:
+          $ref: '#/components/schemas/MessageDirection'
+        providerMessageId:
+          type: string
+          description: Id del mensaje en el proveedor; para deduplicación.
+        receivedAt:
+          type: string
+          format: date-time
+    MessageSentPayload:
+      type: object
+      additionalProperties: false
+      required: [messageId, conversationId, caseId, contactId, channel, sentAt]
+      properties:
+        messageId:
+          $ref: '#/components/schemas/Uuid'
+        conversationId:
+          $ref: '#/components/schemas/Uuid'
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        contactId:
+          $ref: '#/components/schemas/Uuid'
+        channel:
+          $ref: '#/components/schemas/Channel'
+        sentAt:
+          type: string
+          format: date-time
+    MessageDeliveredPayload:
+      type: object
+      additionalProperties: false
+      required: [messageId, conversationId, deliveredAt]
+      properties:
+        messageId:
+          $ref: '#/components/schemas/Uuid'
+        conversationId:
+          $ref: '#/components/schemas/Uuid'
+        deliveredAt:
+          type: string
+          format: date-time
+    MessageReadPayload:
+      type: object
+      additionalProperties: false
+      required: [messageId, conversationId, readAt]
+      properties:
+        messageId:
+          $ref: '#/components/schemas/Uuid'
+        conversationId:
+          $ref: '#/components/schemas/Uuid'
+        readAt:
+          type: string
+          format: date-time
+    MessageFailedPayload:
+      type: object
+      additionalProperties: false
+      required: [messageId, conversationId, reason, failedAt]
+      properties:
+        messageId:
+          $ref: '#/components/schemas/Uuid'
+        conversationId:
+          $ref: '#/components/schemas/Uuid'
+        reason:
+          type: string
+          maxLength: 256
+          description: Motivo reportado por el proveedor (texto corto).
+        failedAt:
+          type: string
+          format: date-time
+    MessageDeliveryUnknownPayload:
+      type: object
+      additionalProperties: false
+      required: [messageId, conversationId, unknownAt]
+      properties:
+        messageId:
+          $ref: '#/components/schemas/Uuid'
+        conversationId:
+          $ref: '#/components/schemas/Uuid'
+        unknownAt:
+          type: string
+          format: date-time
+    ContactOptedOutPayload:
+      type: object
+      additionalProperties: false
+      required: [contactId, customerId, channel, optedOutAt]
+      properties:
+        contactId:
+          $ref: '#/components/schemas/Uuid'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        channel:
+          $ref: '#/components/schemas/Channel'
+        optedOutAt:
+          type: string
+          format: date-time
+    ContactOptedInPayload:
+      type: object
+      additionalProperties: false
+      required: [contactId, customerId, channel, optedInAt]
+      properties:
+        contactId:
+          $ref: '#/components/schemas/Uuid'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        channel:
+          $ref: '#/components/schemas/Channel'
+        optedInAt:
+          type: string
+          format: date-time
+    InboundUnroutedPayload:
+      type: object
+      additionalProperties: false
+      required: [providerMessageId, channel, receivedAt, reason]
+      properties:
+        providerMessageId:
+          type: string
+        channel:
+          $ref: '#/components/schemas/Channel'
+        receivedAt:
+          type: string
+          format: date-time
+        reason:
+          type: string
+          enum: [NO_CHANNEL_ACCOUNT, TENANT_UNRESOLVED, CONTACT_NOT_FOUND]
+          description: Motivo por el que el mensaje no pudo enrutarse a una conversación.
+    CommandRejectedPayload:
+      type: object
+      additionalProperties: false
+      required: [commandId, caseId, commandType, reason]
+      properties:
+        commandId:
+          $ref: '#/components/schemas/Uuid'
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        commandType:
+          type: string
+          const: SendMessage
+        reason:
+          type: string
+          enum: [NO_CONVERSATION, OPTED_OUT, WINDOW_CLOSED, TAKEOVER_ACTIVE, CASE_PAUSED, CASE_CLOSED, VALIDATION_FAILED]
+        detail:
+          type: string
+          maxLength: 512
+
+    SendMessagePayload:
+      type: object
+      additionalProperties: false
+      description: commandId es también la clave de idempotencia del envío (client_ref ante el proveedor).
+      required: [commandId, caseId, permit, contactId, channel, factsRefs]
+      properties:
+        commandId:
+          $ref: '#/components/schemas/Uuid'
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        turnId:
+          type: [string, 'null']
+          format: uuid
+        permit:
+          type: string
+          description: JWS de case-service (scope SEND_MESSAGE, 60 s). conversation-service lo verifica antes de enviar.
+        contactId:
+          $ref: '#/components/schemas/Uuid'
+        channel:
+          $ref: '#/components/schemas/Channel'
+        templateKey:
+          type: [string, 'null']
+        templateParams:
+          type: object
+          additionalProperties:
+            type: string
+        body:
+          type: [string, 'null']
+          maxLength: 4096
+        factsRefs:
+          type: array
+          items:
+            $ref: '#/components/schemas/FactRef'
+    FactRef:
+      type: object
+      additionalProperties: false
+      description: Dato autoritativo insertado en el mensaje por código (no por el LLM), con su origen.
+      required: [source, id, version]
+      properties:
+        source:
+          type: string
+          enum: [LEDGER_BALANCE, INVOICE, PAYMENT_LINK, PROMISE]
+        id:
+          $ref: '#/components/schemas/Uuid'
+        version:
+          type: integer
+          minimum: 1
+
+    CasePausedPayload:
+      type: object
+      additionalProperties: false
+      required: [caseId, aggregateVersion, reason, invoiceIds, actor]
+      properties:
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        aggregateVersion:
+          $ref: '#/components/schemas/AggregateVersion'
+        reason:
+          $ref: '#/components/schemas/PauseReason'
+        invoiceIds:
+          type: array
+          description: Facturas pausadas; vacío significa todo el caso.
+          items:
+            $ref: '#/components/schemas/Uuid'
+        until:
+          type: [string, 'null']
+          format: date-time
+        actor:
+          $ref: '#/components/schemas/Actor'
+    CaseResumedPayload:
+      type: object
+      additionalProperties: false
+      required: [caseId, aggregateVersion, actor]
+      properties:
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        aggregateVersion:
+          $ref: '#/components/schemas/AggregateVersion'
+        actor:
+          $ref: '#/components/schemas/Actor'
+    CaseTakeoverStartedPayload:
+      type: object
+      additionalProperties: false
+      required: [caseId, aggregateVersion, actor]
+      properties:
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        aggregateVersion:
+          $ref: '#/components/schemas/AggregateVersion'
+        actor:
+          $ref: '#/components/schemas/Actor'
+    CaseTakeoverEndedPayload:
+      type: object
+      additionalProperties: false
+      required: [caseId, aggregateVersion, actor]
+      properties:
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        aggregateVersion:
+          $ref: '#/components/schemas/AggregateVersion'
+        actor:
+          $ref: '#/components/schemas/Actor'
+
+    WhatsappIngressPayload:
+      type: object
+      additionalProperties: false
+      description: Payload crudo de WhatsApp, cifrado en reposo en el inbox de webhook-ingress.
+      required: [provider, providerEventId, eventType, receivedAt, rawBody]
+      properties:
+        provider:
+          type: string
+          description: Identificador de la cuenta de canal (rutas a tenant, §7.6).
+        providerEventId:
+          type: string
+          description: Identificador del evento en WhatsApp; UNIQUE (provider, provider_event_id).
+        eventType:
+          type: string
+          description: Tipo de evento según la documentación de Meta.
+        receivedAt:
+          type: string
+          format: date-time
+        rawBody:
+          type: object
+          additionalProperties: true
+          description: Cuerpo crudo del webhook, tal como lo emitió Meta.
+    EmailIngressPayload:
+      type: object
+      additionalProperties: false
+      description: Payload crudo del proveedor de email, cifrado en reposo en el inbox de webhook-ingress.
+      required: [provider, providerEventId, eventType, receivedAt, rawBody]
+      properties:
+        provider:
+          type: string
+          description: Identificador de la cuenta de canal (rutas a tenant, §7.6).
+        providerEventId:
+          type: string
+          description: Identificador del evento en el proveedor; UNIQUE (provider, provider_event_id).
+        eventType:
+          type: string
+          description: Tipo de evento según la documentación del proveedor.
+        receivedAt:
+          type: string
+          format: date-time
+        rawBody:
+          type: object
+          additionalProperties: true
+          description: Cuerpo crudo del webhook, tal como lo emitió el proveedor.

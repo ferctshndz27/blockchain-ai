@@ -1,0 +1,721 @@
+openapi: 3.1.0
+info:
+  title: policy-service API
+  version: 0.1.0
+  description: |
+    v0 — Servicio de decisiones: políticas de negociación versionadas por
+    alcance (tenant → segmento → cliente), reglas de contacto (horarios,
+    frecuencia), calendarios hábiles y festivos, umbrales de aprobación.
+    Decisiones (internas): offer (ALLOW | REQUIRE_APPROVAL | DENY + motivos +
+    policyVersion), allowed-offers, contact (¿se puede contactar ahora? próxima
+    ventana), next-action.
+    Versiones inmutables. Cada decisión devuelve policyVersion; dentro de un
+    turno el agente la reenvía en las llamadas siguientes y cualquier réplica
+    evalúa exactamente esa versión. Sin ella, se usa la vigente.
+    Activación: programada (effective_from ≥ ahora + 60 s); PolicyVersionScheduled
+    precarga las cachés para que todas las réplicas cambien a la vez.
+    Operación: funciones puras; ≥ 3 réplicas; caché por versión invalidada por
+    evento (respaldo: TTL de 5 min).
+    Publica: policy.events.v1 (PolicyVersionScheduled, PolicyVersionActivated,
+    ContactRulesChanged).
+  contact:
+    name: Equipo Conversación e IA (dueño de policy-service)
+  license:
+    name: Propietario
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: http://policy.receivables.svc.cluster.local
+    description: Dentro del clúster (malla con mTLS)
+tags:
+  - name: Policies
+    description: Políticas versionadas por alcance
+  - name: ContactRules
+    description: Reglas de contacto
+  - name: Calendars
+    description: Calendarios hábiles y festivos
+  - name: Decisions
+    description: Decisiones internas (ofertas, contacto, próxima acción)
+  - name: Internal
+    description: Rutas internas (mTLS + token de servicio)
+security:
+  - contextToken: []
+paths:
+  /v1/policies:
+    get:
+      operationId: listPolicies
+      tags: [Policies]
+      summary: Lista políticas por alcance
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: scopeType
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [TENANT, SEGMENT, CUSTOMER]
+        - name: scopeId
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/Uuid'
+      responses:
+        '200':
+          description: Página de políticas.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PolicyPage'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+    post:
+      operationId: createPolicy
+      tags: [Policies]
+      summary: Crea una política (con su primera versión)
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PolicyCreate'
+      responses:
+        '201':
+          description: Política creada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Policy'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+
+  /v1/policies/{policyId}/versions:
+    post:
+      operationId: createPolicyVersion
+      tags: [Policies]
+      summary: Crea una nueva versión inmutable de una política
+      parameters:
+        - $ref: '#/components/parameters/PolicyId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PolicyVersionCreate'
+      responses:
+        '201':
+          description: Versión creada (programada o inmediata).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PolicyVersion'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/Conflict'
+
+  /v1/policies/{policyId}/versions/{version}/activate:
+    post:
+      operationId: activatePolicyVersion
+      tags: [Policies]
+      summary: Activa una versión (inmediata o programada con effective_from)
+      description: |
+        Activación programada: `effective_from` debe ser ≥ ahora + 60 s.
+        Publica PolicyVersionScheduled (precarga de cachés) y, en el momento,
+        PolicyVersionActivated.
+      parameters:
+        - $ref: '#/components/parameters/PolicyId'
+        - name: version
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                effectiveFrom:
+                  type: string
+                  format: date-time
+                  description: Si se omite, la activación es inmediata.
+      responses:
+        '200':
+          description: Activación aceptada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PolicyVersion'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/PreconditionFailed'
+
+  /v1/policies/{policyId}/versions/{version}:
+    get:
+      operationId: getPolicyVersion
+      tags: [Policies]
+      summary: Versión inmutable de una política
+      parameters:
+        - $ref: '#/components/parameters/PolicyId'
+        - name: version
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        '200':
+          description: Versión de la política.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PolicyVersion'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+  /v1/contact-rules:
+    get:
+      operationId: getContactRules
+      tags: [ContactRules]
+      summary: Reglas de contacto vigentes por alcance
+      parameters:
+        - name: scopeType
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [TENANT, SEGMENT, CUSTOMER]
+        - name: scopeId
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/Uuid'
+      responses:
+        '200':
+          description: Reglas de contacto.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContactRules'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+    put:
+      operationId: putContactRules
+      tags: [ContactRules]
+      summary: Establece reglas de contacto (If-Match)
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ContactRules'
+      responses:
+        '200':
+          description: Reglas actualizadas.
+          headers:
+            ETag:
+              $ref: '../common/common.yaml#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContactRules'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/PreconditionFailed'
+
+  /v1/business-calendars:
+    get:
+      operationId: getBusinessCalendar
+      tags: [Calendars]
+      summary: Calendario hábil y festivos de un tenant
+      parameters:
+        - name: calendarId
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/Uuid'
+      responses:
+        '200':
+          description: Calendario.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BusinessCalendar'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+    put:
+      operationId: putBusinessCalendar
+      tags: [Calendars]
+      summary: Establece calendario hábil (If-Match)
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BusinessCalendarWrite'
+      responses:
+        '200':
+          description: Calendario actualizado.
+          headers:
+            ETag:
+              $ref: '../common/common.yaml#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BusinessCalendar'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/PreconditionFailed'
+
+  /internal/v1/decisions/offer:
+    post:
+      operationId: decisionOffer
+      tags: [Decisions]
+      summary: ¿Se puede ofrecer esta oferta? ALLOW | REQUIRE_APPROVAL | DENY
+      description: |
+        Devuelve decisión, motivos y policyVersion. Si el request omite
+        policyVersion, se evalúa la vigente; si la incluye, se evalúa
+        exactamente esa versión.
+      x-internal: true
+      security:
+        - serviceToken: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OfferDecisionRequest'
+      responses:
+        '200':
+          description: Decisión de oferta.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OfferDecision'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+  /internal/v1/decisions/allowed-offers:
+    post:
+      operationId: decisionAllowedOffers
+      tags: [Decisions]
+      summary: Ofertas que el agente puede presentar
+      x-internal: true
+      security:
+        - serviceToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AllowedOffersRequest'
+      responses:
+        '200':
+          description: Ofertas permitidas.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AllowedOffers'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+  /internal/v1/decisions/contact:
+    post:
+      operationId: decisionContact
+      tags: [Decisions]
+      summary: ¿Se puede contactar ahora? próxima ventana
+      x-internal: true
+      security:
+        - serviceToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ContactDecisionRequest'
+      responses:
+        '200':
+          description: Decisión de contacto.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContactDecision'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+  /internal/v1/decisions/next-action:
+    post:
+      operationId: decisionNextAction
+      tags: [Decisions]
+      summary: Próxima acción sugerida por política
+      x-internal: true
+      security:
+        - serviceToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NextActionRequest'
+      responses:
+        '200':
+          description: Próxima acción.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NextAction'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    contextToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/contextToken'
+    serviceToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/serviceToken'
+  parameters:
+    PolicyId:
+      name: policyId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    IdempotencyKey:
+      $ref: '../common/common.yaml#/components/parameters/IdempotencyKey'
+    IfMatch:
+      $ref: '../common/common.yaml#/components/parameters/IfMatch'
+    Cursor:
+      $ref: '../common/common.yaml#/components/parameters/Cursor'
+    Limit:
+      $ref: '../common/common.yaml#/components/parameters/Limit'
+  schemas:
+    Uuid:
+      $ref: '../common/common.yaml#/components/schemas/Uuid'
+    Money:
+      $ref: '../common/common.yaml#/components/schemas/Money'
+    PageInfo:
+      $ref: '../common/common.yaml#/components/schemas/PageInfo'
+    Scope:
+      type: object
+      additionalProperties: false
+      required: [scopeType, scopeId]
+      properties:
+        scopeType:
+          type: string
+          enum: [TENANT, SEGMENT, CUSTOMER]
+        scopeId:
+          $ref: '#/components/schemas/Uuid'
+    Policy:
+      type: object
+      additionalProperties: false
+      required: [policyId, scope, activeVersion]
+      properties:
+        policyId:
+          $ref: '#/components/schemas/Uuid'
+        scope:
+          $ref: '#/components/schemas/Scope'
+        activeVersion:
+          type: integer
+          minimum: 1
+        scheduledVersion:
+          type: integer
+          minimum: 1
+        createdAt:
+          type: string
+          format: date-time
+    PolicyCreate:
+      type: object
+      additionalProperties: false
+      required: [scope, rule]
+      properties:
+        scope:
+          $ref: '#/components/schemas/Scope'
+        rule:
+          $ref: '#/components/schemas/PolicyRule'
+    PolicyVersion:
+      type: object
+      additionalProperties: false
+      required: [policyId, version, rule, status]
+      properties:
+        policyId:
+          $ref: '#/components/schemas/Uuid'
+        version:
+          type: integer
+          minimum: 1
+        status:
+          type: string
+          enum: [DRAFT, SCHEDULED, ACTIVE, SUPERSEDED]
+        effectiveFrom:
+          type: string
+          format: date-time
+        rule:
+          $ref: '#/components/schemas/PolicyRule'
+        createdAt:
+          type: string
+          format: date-time
+    PolicyVersionCreate:
+      type: object
+      additionalProperties: false
+      required: [rule]
+      properties:
+        rule:
+          $ref: '#/components/schemas/PolicyRule'
+        effectiveFrom:
+          type: string
+          format: date-time
+    PolicyRule:
+      type: object
+      additionalProperties: false
+      required: [maxDiscountPct]
+      properties:
+        maxDiscountPct:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 100
+        maxTermDays:
+          type: integer
+          minimum: 0
+        approvalThreshold:
+          $ref: '#/components/schemas/Money'
+          description: Ofertas por encima requieren aprobación humana.
+        allowedChannels:
+          type: array
+          items:
+            type: string
+            enum: [WHATSAPP, PHONE, EMAIL, MESSENGER, IN_APP]
+    PolicyPage:
+      type: object
+      additionalProperties: false
+      required: [items, pageInfo]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Policy'
+        pageInfo:
+          $ref: '#/components/schemas/PageInfo'
+    ContactRules:
+      type: object
+      additionalProperties: false
+      required: [scope, maxContactsPerDay, quietHours]
+      properties:
+        scope:
+          $ref: '#/components/schemas/Scope'
+        maxContactsPerDay:
+          type: integer
+          minimum: 0
+        maxContactsPerWeek:
+          type: integer
+          minimum: 0
+        quietHours:
+          type: object
+          additionalProperties: false
+          required: [start, end]
+          properties:
+            start:
+              type: string
+            end:
+              type: string
+        allowedDays:
+          type: array
+          items:
+            type: integer
+            enum: [1, 2, 3, 4, 5, 6, 7]
+    BusinessCalendar:
+      type: object
+      additionalProperties: false
+      required: [calendarId, timezone]
+      properties:
+        calendarId:
+          $ref: '#/components/schemas/Uuid'
+        timezone:
+          type: string
+          examples: [America/Mexico_City]
+        workDays:
+          type: array
+          items:
+            type: integer
+            enum: [1, 2, 3, 4, 5, 6, 7]
+        holidays:
+          type: array
+          items:
+            type: string
+            format: date
+    BusinessCalendarWrite:
+      type: object
+      additionalProperties: false
+      required: [calendarId, timezone]
+      properties:
+        calendarId:
+          $ref: '#/components/schemas/Uuid'
+        timezone:
+          type: string
+          examples: [America/Mexico_City]
+        workDays:
+          type: array
+          items:
+            type: integer
+            enum: [1, 2, 3, 4, 5, 6, 7]
+        holidays:
+          type: array
+          items:
+            type: string
+            format: date
+    OfferDecisionRequest:
+      type: object
+      additionalProperties: false
+      required: [caseId, offer]
+      properties:
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        policyVersion:
+          type: integer
+          minimum: 1
+          description: Si se omite, se evalúa la vigente.
+        offer:
+          $ref: '#/components/schemas/Offer'
+    Offer:
+      type: object
+      additionalProperties: false
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [DISCOUNT, TERM, WAIVER, PARTIAL_PAYMENT]
+        discountPct:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 100
+        termDays:
+          type: integer
+          minimum: 0
+        amount:
+          $ref: '#/components/schemas/Money'
+    OfferDecision:
+      type: object
+      additionalProperties: false
+      required: [decision, policyVersion, reasons]
+      properties:
+        decision:
+          type: string
+          enum: [ALLOW, REQUIRE_APPROVAL, DENY]
+        policyVersion:
+          type: integer
+          minimum: 1
+        reasons:
+          type: array
+          items:
+            type: string
+        matchedScope:
+          $ref: '#/components/schemas/Scope'
+    AllowedOffersRequest:
+      type: object
+      additionalProperties: false
+      required: [caseId]
+      properties:
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        policyVersion:
+          type: integer
+          minimum: 1
+    AllowedOffers:
+      type: object
+      additionalProperties: false
+      required: [offers, policyVersion]
+      properties:
+        offers:
+          type: array
+          items:
+            $ref: '#/components/schemas/Offer'
+        policyVersion:
+          type: integer
+          minimum: 1
+    ContactDecisionRequest:
+      type: object
+      additionalProperties: false
+      required: [contactId, channel]
+      properties:
+        contactId:
+          $ref: '#/components/schemas/Uuid'
+        channel:
+          type: string
+          enum: [WHATSAPP, PHONE, EMAIL, MESSENGER, IN_APP]
+        policyVersion:
+          type: integer
+          minimum: 1
+    ContactDecision:
+      type: object
+      additionalProperties: false
+      required: [allowed, policyVersion]
+      properties:
+        allowed:
+          type: boolean
+        policyVersion:
+          type: integer
+          minimum: 1
+        nextWindowStart:
+          type: string
+          format: date-time
+        reason:
+          type: string
+    NextActionRequest:
+      type: object
+      additionalProperties: false
+      required: [caseId]
+      properties:
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        policyVersion:
+          type: integer
+          minimum: 1
+    NextAction:
+      type: object
+      additionalProperties: false
+      required: [kind, dueAt, policyVersion]
+      properties:
+        kind:
+          type: string
+          enum: [REACH_CUSTOMER, PROPOSE_PROMISE, REQUEST_APPROVAL, ESCALATE, WAIT]
+        dueAt:
+          type: string
+          format: date-time
+        policyVersion:
+          type: integer
+          minimum: 1

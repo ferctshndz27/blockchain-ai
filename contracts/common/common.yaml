@@ -1,0 +1,199 @@
+openapi: 3.1.0
+info:
+  title: Componentes comunes — AI Receivables
+  version: 1.0.0
+  description: |
+    Esquemas, parámetros, cabeceras, respuestas y esquemas de seguridad compartidos por todas las APIs.
+    No se despliega: los contratos de cada servicio lo referencian.
+  license:
+    name: Propietario
+    identifier: LicenseRef-Proprietary
+components:
+  schemas:
+    Uuid:
+      type: string
+      format: uuid
+      description: UUID v7 (ordenable por tiempo).
+    CurrencyCode:
+      type: string
+      pattern: '^[A-Z]{3}$'
+      description: Código de moneda ISO 4217.
+      examples: [MXN]
+    DecimalString:
+      type: string
+      pattern: '^-?\d{1,15}(\.\d{1,4})?$'
+      description: Decimal exacto como cadena. Nunca número de punto flotante.
+      examples: ['48500.00']
+    Money:
+      type: object
+      additionalProperties: false
+      required: [amount, currency]
+      properties:
+        amount:
+          $ref: '#/components/schemas/DecimalString'
+        currency:
+          $ref: '#/components/schemas/CurrencyCode'
+    Actor:
+      type: object
+      additionalProperties: false
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [HUMAN, AI, SYSTEM]
+        id:
+          type: string
+          description: Id del usuario o del servicio; ausente para SYSTEM.
+    PageInfo:
+      type: object
+      additionalProperties: false
+      required: [nextCursor]
+      properties:
+        nextCursor:
+          type: [string, 'null']
+          description: Cursor opaco para la página siguiente; null si no hay más.
+    Problem:
+      type: object
+      description: Error en formato RFC 9457 (application/problem+json).
+      required: [type, title, status, code]
+      properties:
+        type:
+          type: string
+          format: uri-reference
+        title:
+          type: string
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+        detail:
+          type: string
+        instance:
+          type: string
+          format: uri-reference
+        code:
+          type: string
+          description: Código estable que el cliente puede usar en su lógica.
+          examples: [CASE_VERSION_MISMATCH]
+        traceId:
+          type: string
+        errors:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [pointer, message]
+            properties:
+              pointer:
+                type: string
+                description: JSON Pointer al campo inválido.
+              message:
+                type: string
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Clave única por intento lógico. Se conserva 24 h junto con la respuesta original.
+      schema:
+        type: string
+        minLength: 16
+        maxLength: 128
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      description: ETag recibido en la última lectura (versión del agregado), p. ej. "17".
+      schema:
+        type: string
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema:
+        type: string
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+  headers:
+    ETag:
+      description: Versión actual del agregado, para usar en If-Match.
+      schema:
+        type: string
+  responses:
+    BadRequest:
+      description: Solicitud mal formada.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: Falta el token o no es válido.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: El token es válido pero no tiene permiso para esta acción o recurso.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: El recurso no existe o no pertenece al tenant del token.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: La acción no es válida en el estado actual (p. ej. transición ilegal).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    PreconditionFailed:
+      description: La versión enviada en If-Match ya no es la actual.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    PreconditionRequired:
+      description: Falta la cabecera If-Match.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    UnprocessableContent:
+      description: El cuerpo es válido como JSON pero no cumple las reglas de negocio.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    TooManyRequests:
+      description: Límite de solicitudes excedido.
+      headers:
+        Retry-After:
+          description: Segundos a esperar antes de reintentar.
+          schema:
+            type: integer
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  securitySchemes:
+    contextToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Token de contexto interno emitido por identity-service (tenant, usuario, permisos, aud por servicio).
+    serviceToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Token de servicio o de capacidad (agente). Además, mTLS dentro de la malla.

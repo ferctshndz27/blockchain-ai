@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Hook pre-commit de Coin: no deja hacer commit si los contratos preparados (staged) tienen errores de lint.
+# Activar una vez por clon:  git config core.hooksPath .githooks
+# Saltar en una emergencia:  git commit --no-verify   (CI lo volverá a comprobar)
+# Nota: lintea la versión del árbol de trabajo de cada archivo preparado; si tienes cambios
+# parciales (git add -p) en un contrato, lo que se comprueba puede diferir de lo que se confirma.
+set -u
+ROOT="$(git rev-parse --show-toplevel)" || exit 1
+
+mapfile -t staged < <(git diff --cached --name-only --diff-filter=ACMR -- 'contracts/')
+[ "${#staged[@]}" -eq 0 ] && exit 0
+
+echo "pre-commit: lint de ${#staged[@]} archivo(s) de contracts/"
+if ! "$ROOT/scripts/lint-contracts.sh" "${staged[@]}"; then
+  echo >&2
+  echo "pre-commit: commit rechazado por errores en los contratos. Corrige y vuelve a intentar" >&2
+  echo "            (o git commit --no-verify si de verdad hace falta)." >&2
+  exit 1
+fi

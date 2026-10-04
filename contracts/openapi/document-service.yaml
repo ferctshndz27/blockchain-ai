@@ -1,0 +1,332 @@
+openapi: 3.1.0
+info:
+  title: document-service API
+  version: 0.1.0
+  description: |
+    v0 — Archivos y metadatos: SHA-256, antivirus, cuarentena, vínculos a
+    entidades y URLs firmadas.
+    Publica: document.events.v1 (DocumentUploaded, DocumentScanned
+    [CLEAN | INFECTED], DocumentLinked).
+  contact:
+    name: Equipo Conversación e IA (dueño de document-service)
+  license:
+    name: Propietario
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: http://document.receivables.svc.cluster.local
+    description: Dentro del clúster (malla con mTLS)
+tags:
+  - name: Documents
+    description: Archivos, metadatos y URLs firmadas
+  - name: Uploads
+    description: Subidas prefirmadas
+  - name: Internal
+    description: Rutas internas (mTLS + token de servicio)
+security:
+  - contextToken: []
+paths:
+  /v1/document-uploads:
+    post:
+      operationId: createUpload
+      tags: [Uploads]
+      summary: Crea una subida prefirmada (URL de destino)
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UploadCreate'
+      responses:
+        '201':
+          description: URL prefirmada para el upload.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Upload'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+
+  /v1/document-uploads/{uploadId}/complete:
+    post:
+      operationId: completeUpload
+      tags: [Uploads]
+      summary: Confirma el upload y dispara escaneo + SHA-256
+      parameters:
+        - name: uploadId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [sha256]
+              properties:
+                sha256:
+                  type: string
+                  pattern: '^[a-f0-9]{64}$'
+      responses:
+        '200':
+          description: Upload completado; documento en escaneo.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Document'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+  /v1/documents:
+    get:
+      operationId: listDocuments
+      tags: [Documents]
+      summary: Lista documentos por entidad
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: entityType
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 64
+        - name: entityId
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/Uuid'
+      responses:
+        '200':
+          description: Página de documentos.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentPage'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+
+  /v1/documents/{documentId}:
+    get:
+      operationId: getDocument
+      tags: [Documents]
+      summary: Metadatos de un documento
+      parameters:
+        - name: documentId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+      responses:
+        '200':
+          description: Documento.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Document'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+  /v1/documents/{documentId}/download-url:
+    get:
+      operationId: getDownloadUrl
+      tags: [Documents]
+      summary: URL firmada de descarga (vida corta)
+      parameters:
+        - name: documentId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - name: ttlSeconds
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 30
+            maximum: 3600
+            default: 300
+      responses:
+        '200':
+          description: URL firmada.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [url, expiresAt]
+                properties:
+                  url:
+                    type: string
+                    format: uri
+                  expiresAt:
+                    type: string
+                    format: date-time
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+  /internal/v1/documents:ingest-from-url:
+    post:
+      operationId: ingestFromUrl
+      tags: [Internal]
+      summary: Ingesta un medio de WhatsApp/email (allowlist anti-SSRF)
+      description: |
+        Solo URLs en la allowlist (bucles de Meta y S3 del tenant). El
+        adaptador descarga, calcula SHA-256, escanea y crea el documento.
+      x-internal: true
+      security:
+        - serviceToken: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [url, source, entityType, entityId]
+              properties:
+                url:
+                  type: string
+                  format: uri
+                source:
+                  type: string
+                  enum: [WHATSAPP, EMAIL]
+                entityType:
+                  type: string
+                  maxLength: 64
+                entityId:
+                  $ref: '#/components/schemas/Uuid'
+      responses:
+        '201':
+          description: Documento creado (en escaneo).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Document'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/Conflict'
+
+components:
+  securitySchemes:
+    contextToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/contextToken'
+    serviceToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/serviceToken'
+  parameters:
+    IdempotencyKey:
+      $ref: '../common/common.yaml#/components/parameters/IdempotencyKey'
+    Cursor:
+      $ref: '../common/common.yaml#/components/parameters/Cursor'
+    Limit:
+      $ref: '../common/common.yaml#/components/parameters/Limit'
+  schemas:
+    Uuid:
+      $ref: '../common/common.yaml#/components/schemas/Uuid'
+    PageInfo:
+      $ref: '../common/common.yaml#/components/schemas/PageInfo'
+    ScanStatus:
+      type: string
+      enum: [PENDING, CLEAN, INFECTED, QUARANTINED]
+    Upload:
+      type: object
+      additionalProperties: false
+      required: [uploadId, uploadUrl, expiresAt, maxBytes]
+      properties:
+        uploadId:
+          $ref: '#/components/schemas/Uuid'
+        uploadUrl:
+          type: string
+          format: uri
+        method:
+          type: string
+          enum: [PUT, POST]
+        expiresAt:
+          type: string
+          format: date-time
+        maxBytes:
+          type: integer
+          minimum: 1
+        contentType:
+          type: string
+          maxLength: 128
+    UploadCreate:
+      type: object
+      additionalProperties: false
+      required: [filename, contentType]
+      properties:
+        filename:
+          type: string
+          maxLength: 255
+        contentType:
+          type: string
+          maxLength: 128
+        sizeBytes:
+          type: integer
+          minimum: 0
+        entityType:
+          type: string
+          maxLength: 64
+        entityId:
+          $ref: '#/components/schemas/Uuid'
+    Document:
+      type: object
+      additionalProperties: false
+      required: [documentId, filename, contentType, sha256, scanStatus]
+      properties:
+        documentId:
+          $ref: '#/components/schemas/Uuid'
+        filename:
+          type: string
+          maxLength: 255
+        contentType:
+          type: string
+          maxLength: 128
+        sizeBytes:
+          type: integer
+          minimum: 0
+        sha256:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        scanStatus:
+          $ref: '#/components/schemas/ScanStatus'
+        entityType:
+          type: string
+          maxLength: 64
+        entityId:
+          $ref: '#/components/schemas/Uuid'
+        source:
+          type: string
+          enum: [MANUAL, WHATSAPP, EMAIL]
+        createdAt:
+          type: string
+          format: date-time
+    DocumentPage:
+      type: object
+      additionalProperties: false
+      required: [items, pageInfo]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Document'
+        pageInfo:
+          $ref: '#/components/schemas/PageInfo'

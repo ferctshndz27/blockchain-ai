@@ -1,0 +1,448 @@
+openapi: 3.1.0
+info:
+  title: payment-service API
+  version: 0.1.0
+  description: |
+    v0 — Medios de cobro (links de pago, CLABEs virtuales), pagos del PSP y de
+    bancos, reversas y contracargos, cuentas PSP y sus rutas a tenant; capa
+    anticorrupción hacia el PSP.
+    Regla: un pago pasa a CONFIRMED solo tras consultar su estado en la API del
+    PSP, nunca por el webhook solo.
+    Publica: payment.events.v1 (PaymentReceived, PaymentConfirmed, PaymentFailed,
+    PaymentReversed, PaymentLinkCreated, PaymentLinkExpired).
+    Consume: ingress.psp.v1, ingress.bank.v1.
+  contact:
+    name: Equipo Conversación e IA (dueño de payment-service)
+  license:
+    name: Propietario
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: http://payment.receivables.svc.cluster.local
+    description: Dentro del clúster (malla con mTLS)
+tags:
+  - name: Payments
+    description: Pagos del PSP y de bancos
+  - name: PaymentLinks
+    description: Links de pago
+  - name: VirtualAccounts
+    description: CLABEs virtuales
+  - name: PSPAccounts
+    description: Cuentas PSP y rutas a tenant
+  - name: Internal
+    description: Rutas internas (mTLS + token de servicio)
+security:
+  - contextToken: []
+paths:
+  /v1/payments:
+    get:
+      operationId: listPayments
+      tags: [Payments]
+      summary: Lista pagos con filtros
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/PaymentStatus'
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+      responses:
+        '200':
+          description: Página de pagos.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentPage'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+
+  /v1/payments/{paymentId}:
+    get:
+      operationId: getPayment
+      tags: [Payments]
+      summary: Detalle de un pago
+      parameters:
+        - $ref: '#/components/parameters/PaymentId'
+      responses:
+        '200':
+          description: Pago.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payment'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+  /v1/cases/{caseId}/payment-links:
+    post:
+      operationId: createPaymentLink
+      tags: [PaymentLinks]
+      summary: Crea un link de pago para un caso
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentLinkCreate'
+      responses:
+        '201':
+          description: Link de pago creado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentLink'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+  /v1/customers/{customerId}/virtual-accounts:
+    get:
+      operationId: listVirtualAccounts
+      tags: [VirtualAccounts]
+      summary: Lista CLABEs virtuales de un cliente
+      parameters:
+        - name: customerId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Página de CLABEs virtuales.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VirtualAccountPage'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+  /v1/psp-accounts:
+    get:
+      operationId: listPspAccounts
+      tags: [PSPAccounts]
+      summary: Cuentas PSP y sus rutas a tenant
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Página de cuentas PSP.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PspAccountPage'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+
+  /internal/v1/payment-links:
+    post:
+      operationId: internalCreatePaymentLink
+      tags: [Internal]
+      summary: Crea un link de pago (idempotente por Idempotency-Key)
+      description: |
+        El agente necesita la URL para enviarla. `Idempotency-Key` garantiza
+        idempotencia; llamar dos veces con la misma clave devuelve el mismo link.
+      x-internal: true
+      security:
+        - serviceToken: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentLinkCreate'
+      responses:
+        '201':
+          description: Link de pago creado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentLink'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/Conflict'
+
+  /internal/v1/payment-links/{token}:
+    get:
+      operationId: internalValidatePaymentLink
+      tags: [Internal]
+      summary: Valida un link de pago para portal-bff
+      x-internal: true
+      security:
+        - serviceToken: []
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 128
+      responses:
+        '200':
+          description: Link válido.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentLink'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+  /internal/v1/payments:import:
+    post:
+      operationId: importPayments
+      tags: [Internal]
+      summary: Importa estados de cuenta bancarios
+      x-internal: true
+      security:
+        - serviceToken: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [source, records]
+              properties:
+                source:
+                  type: string
+                records:
+                  type: array
+                  minItems: 1
+                  maxItems: 1000
+                  items:
+                    $ref: '#/components/schemas/PaymentImportRecord'
+      responses:
+        '200':
+          description: Resultados del lote.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [applied, skipped]
+                properties:
+                  applied:
+                    type: integer
+                  skipped:
+                    type: integer
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common.yaml#/components/responses/Forbidden'
+
+components:
+  securitySchemes:
+    contextToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/contextToken'
+    serviceToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/serviceToken'
+  parameters:
+    CaseId:
+      name: caseId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    PaymentId:
+      name: paymentId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    IdempotencyKey:
+      $ref: '../common/common.yaml#/components/parameters/IdempotencyKey'
+    Cursor:
+      $ref: '../common/common.yaml#/components/parameters/Cursor'
+    Limit:
+      $ref: '../common/common.yaml#/components/parameters/Limit'
+  schemas:
+    Uuid:
+      $ref: '../common/common.yaml#/components/schemas/Uuid'
+    Money:
+      $ref: '../common/common.yaml#/components/schemas/Money'
+    PageInfo:
+      $ref: '../common/common.yaml#/components/schemas/PageInfo'
+    PaymentStatus:
+      type: string
+      enum: [RECEIVED, CONFIRMED, FAILED, REVERSED, CHARGED_BACK]
+    Payment:
+      type: object
+      additionalProperties: false
+      required: [paymentId, source, amount, currency, status]
+      properties:
+        paymentId:
+          $ref: '#/components/schemas/Uuid'
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        source:
+          type: string
+          enum: [PSP, BANK, VIRTUAL_ACCOUNT]
+        providerRef:
+          type: string
+          description: Referencia del proveedor (id PSP / referencia bancaria).
+        amount:
+          $ref: '#/components/schemas/Money'
+        currency:
+          type: string
+        receivedAt:
+          type: string
+          format: date-time
+        status:
+          $ref: '#/components/schemas/PaymentStatus'
+        confirmedAt:
+          type: string
+          format: date-time
+        reversedAt:
+          type: string
+          format: date-time
+    PaymentPage:
+      type: object
+      additionalProperties: false
+      required: [items, pageInfo]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Payment'
+        pageInfo:
+          $ref: '#/components/schemas/PageInfo'
+    PaymentLink:
+      type: object
+      additionalProperties: false
+      required: [paymentLinkId, caseId, amount, url, status]
+      properties:
+        paymentLinkId:
+          $ref: '#/components/schemas/Uuid'
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        token:
+          type: string
+          maxLength: 128
+        amount:
+          $ref: '#/components/schemas/Money'
+        url:
+          type: string
+          format: uri
+        status:
+          type: string
+          enum: [ACTIVE, USED, EXPIRED]
+        expiresAt:
+          type: string
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+    PaymentLinkCreate:
+      type: object
+      additionalProperties: false
+      required: [caseId, amount]
+      properties:
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        amount:
+          $ref: '#/components/schemas/Money'
+        expiresAt:
+          type: string
+          format: date-time
+    VirtualAccount:
+      type: object
+      additionalProperties: false
+      required: [virtualAccountId, customerId, clabe, status]
+      properties:
+        virtualAccountId:
+          $ref: '#/components/schemas/Uuid'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        clabe:
+          type: string
+          pattern: '^[0-9]{18}$'
+        status:
+          type: string
+          enum: [ACTIVE, CLOSED]
+    VirtualAccountPage:
+      type: object
+      additionalProperties: false
+      required: [items, pageInfo]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/VirtualAccount'
+        pageInfo:
+          $ref: '#/components/schemas/PageInfo'
+    PspAccount:
+      type: object
+      additionalProperties: false
+      required: [pspAccountId, provider, status]
+      properties:
+        pspAccountId:
+          $ref: '#/components/schemas/Uuid'
+        provider:
+          type: string
+        providerAccountId:
+          type: string
+          maxLength: 256
+        status:
+          type: string
+          enum: [ACTIVE, SUSPENDED, DELETED]
+    PspAccountPage:
+      type: object
+      additionalProperties: false
+      required: [items, pageInfo]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PspAccount'
+        pageInfo:
+          $ref: '#/components/schemas/PageInfo'
+    PaymentImportRecord:
+      type: object
+      additionalProperties: false
+      required: [providerRef, amount, receivedAt]
+      properties:
+        providerRef:
+          type: string
+          maxLength: 256
+        amount:
+          $ref: '#/components/schemas/Money'
+        currency:
+          type: string
+        receivedAt:
+          type: string
+          format: date-time
+        clabe:
+          type: string
+          pattern: '^[0-9]{18}$'

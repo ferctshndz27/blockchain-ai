@@ -1,0 +1,204 @@
+openapi: 3.1.0
+info:
+  title: knowledge-service API
+  version: 0.1.0
+  description: |
+    v0 — F2. OCR y layout, extracción de documentos no CFDI, chunks,
+    embeddings y recuperación híbrida con citas.
+    API interna: POST /internal/v1/retrievals (filtros obligatorios
+    tenant/cliente/caso → chunks con procedencia) y POST /internal/v1/extractions (→ 202).
+    Consume: document (DocumentScanned = CLEAN, DocumentLinked).
+    Publica: knowledge.events.v1 (DocumentIndexed, ExtractionCompleted).
+  contact:
+    name: Equipo Conversación e IA (dueño de knowledge-service)
+  license:
+    name: Propietario
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: http://knowledge.receivables.svc.cluster.local
+    description: Dentro del clúster (malla con mTLS)
+tags:
+  - name: Retrievals
+    description: Recuperación híbrida con citas
+  - name: Extractions
+    description: Extracción de documentos no CFDI
+security:
+  - contextToken: []
+paths:
+  /internal/v1/retrievals:
+    post:
+      operationId: createRetrieval
+      tags: [Retrievals]
+      summary: "Recupera chunks con procedencia (filtros obligatorios cliente/caso; tenant del token)"
+      description: |
+        El tenant sale del token de capacidad; cliente y caso son filtros obligatorios. Devuelve chunks
+        con su procedencia (documento, página, coordenadas) para citas.
+      x-internal: true
+      security:
+        - serviceToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RetrievalRequest'
+      responses:
+        '200':
+          description: Resultados de recuperación.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetrievalResult'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+  /internal/v1/extractions:
+    post:
+      operationId: createExtraction
+      tags: [Extractions]
+      summary: "Encola la extracción de un documento no CFDI (asincrónico)"
+      x-internal: true
+      security:
+        - serviceToken: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExtractionRequest'
+      responses:
+        '202':
+          description: Extracción en cola.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Extraction'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+  /internal/v1/extractions/{extractionId}:
+    get:
+      operationId: getExtraction
+      tags: [Extractions]
+      summary: Estado y campos extraídos de una extracción
+      x-internal: true
+      security:
+        - serviceToken: []
+      parameters:
+        - name: extractionId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+      responses:
+        '200':
+          description: Extracción.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Extraction'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    contextToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/contextToken'
+    serviceToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/serviceToken'
+  parameters:
+    IdempotencyKey:
+      $ref: '../common/common.yaml#/components/parameters/IdempotencyKey'
+  schemas:
+    Uuid:
+      $ref: '../common/common.yaml#/components/schemas/Uuid'
+    RetrievalRequest:
+      type: object
+      additionalProperties: false
+      required: [customerId, caseId, query]
+      properties:
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        query:
+          type: string
+          maxLength: 2000
+        topK:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 10
+        filters:
+          type: object
+          additionalProperties: true
+    Chunk:
+      type: object
+      additionalProperties: false
+      required: [text, score]
+      properties:
+        text:
+          type: string
+        score:
+          type: number
+          format: float
+        provenance:
+          type: object
+          additionalProperties: false
+          properties:
+            documentId:
+              $ref: '#/components/schemas/Uuid'
+            page:
+              type: integer
+              minimum: 1
+            bbox:
+              type: array
+              items:
+                type: number
+    RetrievalResult:
+      type: object
+      additionalProperties: false
+      required: [query, chunks]
+      properties:
+        query:
+          type: string
+        chunks:
+          type: array
+          items:
+            $ref: '#/components/schemas/Chunk'
+    ExtractionRequest:
+      type: object
+      additionalProperties: false
+      required: [documentId, template]
+      properties:
+        documentId:
+          $ref: '#/components/schemas/Uuid'
+        template:
+          type: string
+          maxLength: 128
+          description: Plantilla de campos a extraer.
+    Extraction:
+      type: object
+      additionalProperties: false
+      required: [extractionId, documentId, status]
+      properties:
+        extractionId:
+          $ref: '#/components/schemas/Uuid'
+        documentId:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          type: string
+          enum: [QUEUED, RUNNING, COMPLETED, FAILED]
+        fields:
+          type: object
+          additionalProperties: true
+          description: Campos extraídos con su confianza.
+        error:
+          type: string
+          maxLength: 1000

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Hook post-commit de Coin: avisa al Jenkins local (si está encendido) de que hay un commit nuevo para que
+# construya la rama sin esperar al escaneo periódico de 2 minutos. Nunca falla ni retrasa el commit.
+# Usa jenkinsctl (01-TOOLS/jenkins del harness, directorio hermano de este repositorio), que guarda las
+# credenciales; en un clon sin ese directorio no hace nada. Otra ruta: JENKINSCTL=/ruta/a/jenkinsctl
+root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+ctl="${JENKINSCTL:-$root/../01-TOOLS/jenkins/jenkinsctl}"
+[ -x "$ctl" ] && { "$ctl" scan coin --quiet >/dev/null 2>&1 & }
+exit 0

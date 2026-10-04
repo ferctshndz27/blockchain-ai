@@ -1,0 +1,457 @@
+openapi: 3.1.0
+info:
+  title: invoice-service API
+  version: 0.1.0
+  description: |
+    v0 — Facturas (datos CFDI 4.0), notas de crédito, cancelaciones,
+    importaciones CSV/XML, antigüedad y tick diario por tenant.
+    Regla: invoice-service es dueño del DOCUMENTO; ledger-service es dueño
+    del SALDO. `settlementStatus` es una proyección de solo lectura que
+    invoice-service obtiene consumiendo ledger.events.v1 (InvoiceBalanceChanged).
+    Publica: invoice.events.v1 (InvoiceIssued, InvoiceUpdated, InvoiceCancelled,
+    CreditNoteIssued, InvoiceDueSoon, InvoiceBecameOverdue,
+    InvoiceAgingBucketChanged, InvoiceImportCompleted).
+    Consume: ledger.events.v1 (proyección settlementStatus), identity.events.v1
+    (zona horaria del tenant).
+  contact:
+    name: Equipo Conversación e IA (dueño de invoice-service)
+  license:
+    name: Propietario
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: http://invoice.receivables.svc.cluster.local
+    description: Dentro del clúster (malla con mTLS)
+tags:
+  - name: Invoices
+    description: Facturas y notas de crédito
+  - name: Imports
+    description: Importaciones CSV/XML
+  - name: Internal
+    description: Rutas internas (mTLS + token de servicio)
+security:
+  - contextToken: []
+paths:
+  /v1/invoices:
+    get:
+      operationId: listInvoices
+      tags: [Invoices]
+      summary: Lista facturas con filtros
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: customerId
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [OPEN, PARTIALLY_PAID, PAID, CANCELLED]
+        - name: dueBefore
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+      responses:
+        '200':
+          description: Página de facturas.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvoicePage'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+    post:
+      operationId: createInvoice
+      tags: [Invoices]
+      summary: Emite una factura (datos CFDI 4.0)
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InvoiceCreate'
+      responses:
+        '201':
+          description: Factura emitida.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Invoice'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/Conflict'
+
+  /v1/invoices/{invoiceId}:
+    get:
+      operationId: getInvoice
+      tags: [Invoices]
+      summary: Detalle de una factura
+      parameters:
+        - $ref: '#/components/parameters/InvoiceId'
+      responses:
+        '200':
+          description: Factura.
+          headers:
+            ETag:
+              $ref: '../common/common.yaml#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Invoice'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+    patch:
+      operationId: patchInvoice
+      tags: [Invoices]
+      summary: Actualiza una factura (If-Match)
+      parameters:
+        - $ref: '#/components/parameters/InvoiceId'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InvoicePatch'
+      responses:
+        '200':
+          description: Factura actualizada.
+          headers:
+            ETag:
+              $ref: '../common/common.yaml#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Invoice'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/PreconditionFailed'
+
+  /v1/invoice-imports:
+    post:
+      operationId: createInvoiceImport
+      tags: [Imports]
+      summary: Inicia una importación CSV/XML (202 + Location)
+      description: |
+        El archivo se sube antes a document-service; aquí se referencia por
+        `documentId` y se procesa de forma asíncrona.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [documentId, format]
+              properties:
+                documentId:
+                  $ref: '#/components/schemas/Uuid'
+                format:
+                  type: string
+                  enum: [CSV, XML, CFDI]
+      responses:
+        '202':
+          description: Importación en proceso.
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportStatus'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+
+  /v1/invoice-imports/{importId}:
+    get:
+      operationId: getInvoiceImport
+      tags: [Imports]
+      summary: Estado de una importación
+      parameters:
+        - $ref: '#/components/parameters/ImportId'
+      responses:
+        '200':
+          description: Estado de la importación.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportStatus'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+  /v1/invoice-imports/{importId}/errors:
+    get:
+      operationId: getInvoiceImportErrors
+      tags: [Imports]
+      summary: Errores línea por línea de una importación
+      parameters:
+        - $ref: '#/components/parameters/ImportId'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Errores de la importación.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportErrorsPage'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+  /internal/v1/invoices:batch-get:
+    post:
+      operationId: batchGetInvoices
+      tags: [Internal]
+      summary: Obtiene varias facturas por id (lote)
+      x-internal: true
+      security:
+        - serviceToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [invoiceIds]
+              properties:
+                invoiceIds:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items:
+                    $ref: '#/components/schemas/Uuid'
+      responses:
+        '200':
+          description: Facturas encontradas.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [invoices]
+                properties:
+                  invoices:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Invoice'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common.yaml#/components/responses/Forbidden'
+
+  /internal/v1/customers/{customerId}/open-invoices:
+    get:
+      operationId: getOpenInvoices
+      tags: [Internal]
+      summary: Facturas abiertas de un cliente
+      x-internal: true
+      security:
+        - serviceToken: []
+      parameters:
+        - name: customerId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+      responses:
+        '200':
+          description: Facturas abiertas.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [invoices]
+                properties:
+                  invoices:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Invoice'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common.yaml#/components/responses/Forbidden'
+
+components:
+  securitySchemes:
+    contextToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/contextToken'
+    serviceToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/serviceToken'
+  parameters:
+    InvoiceId:
+      name: invoiceId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    ImportId:
+      name: importId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    IdempotencyKey:
+      $ref: '../common/common.yaml#/components/parameters/IdempotencyKey'
+    IfMatch:
+      $ref: '../common/common.yaml#/components/parameters/IfMatch'
+    Cursor:
+      $ref: '../common/common.yaml#/components/parameters/Cursor'
+    Limit:
+      $ref: '../common/common.yaml#/components/parameters/Limit'
+  schemas:
+    Uuid:
+      $ref: '../common/common.yaml#/components/schemas/Uuid'
+    Money:
+      $ref: '../common/common.yaml#/components/schemas/Money'
+    PageInfo:
+      $ref: '../common/common.yaml#/components/schemas/PageInfo'
+    Invoice:
+      type: object
+      additionalProperties: false
+      required: [invoiceId, customerId, total, currency, issueDate, dueDate, status, version]
+      properties:
+        invoiceId:
+          $ref: '#/components/schemas/Uuid'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        folio:
+          type: string
+          maxLength: 64
+        uuidCfdi:
+          type: string
+          description: UUID del CFDI 4.0 (si aplica).
+        total:
+          $ref: '#/components/schemas/Money'
+        currency:
+          type: string
+        issueDate:
+          type: string
+          format: date
+        dueDate:
+          type: string
+          format: date
+        agingBucket:
+          type: string
+          enum: [CURRENT, D1_15, D16_30, D31_60, D61_90, D90_PLUS]
+        status:
+          type: string
+          enum: [OPEN, PARTIALLY_PAID, PAID, CANCELLED]
+        settlementStatus:
+          type: string
+          description: Proyección de solo lectura desde ledger-service.
+          enum: [SETTLED, PARTIALLY_SETTLED, UNSETTLED]
+        version:
+          type: integer
+          minimum: 1
+        createdAt:
+          type: string
+          format: date-time
+    InvoiceCreate:
+      type: object
+      additionalProperties: false
+      required: [customerId, total, dueDate]
+      properties:
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        folio:
+          type: string
+          maxLength: 64
+        uuidCfdi:
+          type: string
+        total:
+          $ref: '#/components/schemas/Money'
+        dueDate:
+          type: string
+          format: date
+        issueDate:
+          type: string
+          format: date
+    InvoicePatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        folio:
+          type: string
+          maxLength: 64
+        dueDate:
+          type: string
+          format: date
+    InvoicePage:
+      type: object
+      additionalProperties: false
+      required: [items, pageInfo]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Invoice'
+        pageInfo:
+          $ref: '#/components/schemas/PageInfo'
+    ImportStatus:
+      type: object
+      additionalProperties: false
+      required: [importId, status, processed, failed]
+      properties:
+        importId:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          type: string
+          enum: [PENDING, PROCESSING, COMPLETED, COMPLETED_WITH_ERRORS, FAILED]
+        processed:
+          type: integer
+        failed:
+          type: integer
+        completedAt:
+          type: string
+          format: date-time
+    ImportError:
+      type: object
+      additionalProperties: false
+      required: [line, code, message]
+      properties:
+        line:
+          type: integer
+        code:
+          type: string
+        message:
+          type: string
+          maxLength: 500
+    ImportErrorsPage:
+      type: object
+      additionalProperties: false
+      required: [items, pageInfo]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImportError'
+        pageInfo:
+          $ref: '#/components/schemas/PageInfo'

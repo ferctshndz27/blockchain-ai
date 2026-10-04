@@ -1,0 +1,273 @@
+openapi: 3.1.0
+info:
+  title: task-service API
+  version: 0.1.0
+  description: |
+    v0 — Bandeja de trabajo humano (aprobaciones, conciliación manual, números
+    desconocidos, escalamientos, disputas por revisar): creación, asignación,
+    SLA y comentarios.
+    Regla: la decisión NO se toma aquí. Cada tarea apunta al recurso del dueño
+    (p. ej. POST /v1/proposals/{proposalId}/approve en agent-service), que
+    revalida y emite el evento que cierra la tarea.
+    Publica: task.events.v1 (TaskCreated, TaskAssigned, TaskClosed,
+    TaskSlaBreached).
+    Consume: agent (ProposalCreated, ProposalApproved, ProposalRejected,
+    ProposalExpired, ProposalStale), ledger (PaymentUnmatched,
+    PaymentAllocated), conversation (InboundUnrouted), case (CasePaused motivo
+    DISPUTE, CaseTransitioned → ESCALATED), dispute (F2).
+  contact:
+    name: Equipo Conversación e IA (dueño de task-service)
+  license:
+    name: Propietario
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: http://task.receivables.svc.cluster.local
+    description: Dentro del clúster (malla con mTLS)
+tags:
+  - name: Tasks
+    description: Bandeja de trabajo humano
+security:
+  - contextToken: []
+paths:
+  /v1/tasks:
+    get:
+      operationId: listTasks
+      tags: [Tasks]
+      summary: Lista tareas de la bandeja
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: type
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/TaskType'
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/TaskStatus'
+        - name: assignee
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 128
+      responses:
+        '200':
+          description: Página de tareas.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskPage'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+
+  /v1/tasks/{taskId}:
+    get:
+      operationId: getTask
+      tags: [Tasks]
+      summary: Detalle de una tarea (recurso del dueño + comentarios)
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+      responses:
+        '200':
+          description: Tarea.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+  /v1/tasks/{taskId}/claim:
+    post:
+      operationId: claimTask
+      tags: [Tasks]
+      summary: Toma una tarea (asignación explícita)
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Tarea tomada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/Conflict'
+
+  /v1/tasks/{taskId}/release:
+    post:
+      operationId: releaseTask
+      tags: [Tasks]
+      summary: Libera una tarea de vuelta a la cola
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Tarea liberada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/PreconditionFailed'
+
+  /v1/tasks/{taskId}/comments:
+    post:
+      operationId: addTaskComment
+      tags: [Tasks]
+      summary: Añade un comentario a la tarea
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [body]
+              properties:
+                body:
+                  type: string
+                  maxLength: 4000
+      responses:
+        '201':
+          description: Comentario registrado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskComment'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    contextToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/contextToken'
+  parameters:
+    TaskId:
+      name: taskId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    IdempotencyKey:
+      $ref: '../common/common.yaml#/components/parameters/IdempotencyKey'
+    IfMatch:
+      $ref: '../common/common.yaml#/components/parameters/IfMatch'
+    Cursor:
+      $ref: '../common/common.yaml#/components/parameters/Cursor'
+    Limit:
+      $ref: '../common/common.yaml#/components/parameters/Limit'
+  schemas:
+    Uuid:
+      $ref: '../common/common.yaml#/components/schemas/Uuid'
+    PageInfo:
+      $ref: '../common/common.yaml#/components/schemas/PageInfo'
+    TaskType:
+      type: string
+      enum: [APPROVAL, MANUAL_RECONCILIATION, UNKNOWN_NUMBER, ESCALATION, DISPUTE_REVIEW]
+    TaskStatus:
+      type: string
+      enum: [OPEN, ASSIGNED, CLOSED]
+    Task:
+      type: object
+      additionalProperties: false
+      required: [taskId, type, status, target, createdAt, slaBreachedAt]
+      properties:
+        taskId:
+          $ref: '#/components/schemas/Uuid'
+        type:
+          $ref: '#/components/schemas/TaskType'
+        status:
+          $ref: '#/components/schemas/TaskStatus'
+        target:
+          $ref: '#/components/schemas/TaskTarget'
+        assignee:
+          type: string
+          maxLength: 128
+        slaDueAt:
+          type: string
+          format: date-time
+        slaBreachedAt:
+          type: [string, 'null']
+          format: date-time
+        version:
+          type: integer
+          minimum: 1
+        createdAt:
+          type: string
+          format: date-time
+        assignedAt:
+          type: string
+          format: date-time
+        closedAt:
+          type: string
+          format: date-time
+        comments:
+          type: array
+          items:
+            $ref: '#/components/schemas/TaskComment'
+    TaskTarget:
+      type: object
+      additionalProperties: false
+      required: [service, resource]
+      properties:
+        service:
+          type: string
+          maxLength: 64
+          description: Servicio dueño de la decisión (p. ej. agent-service).
+        resource:
+          type: string
+          format: uri
+          description: Recurso donde se toma la decisión.
+        entityId:
+          $ref: '#/components/schemas/Uuid'
+    TaskComment:
+      type: object
+      additionalProperties: false
+      required: [commentId, body, createdAt]
+      properties:
+        commentId:
+          $ref: '#/components/schemas/Uuid'
+        author:
+          type: string
+          maxLength: 128
+        body:
+          type: string
+          maxLength: 4000
+        createdAt:
+          type: string
+          format: date-time
+    TaskPage:
+      type: object
+      additionalProperties: false
+      required: [items, pageInfo]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Task'
+        pageInfo:
+          $ref: '#/components/schemas/PageInfo'

@@ -1,0 +1,453 @@
+asyncapi: 3.1.0
+info:
+  title: payment-service — eventos
+  version: 0.1.0
+  description: |
+    v0 — Hechos de pagos y medios de cobro que publica payment-service: pagos del PSP y de
+    bancos, reversas y contracargos, y ciclo de vida de links de pago. Consume los webhooks
+    crudos del PSP y del banco publicados por webhook-ingress.
+
+    - Envoltura CloudEvents 1.0 en modo binario (cabeceras `ce_*`).
+    - Key de Kafka = id del agregado por evento (paymentId, paymentLinkId; providerEventId en
+      los topics de ingreso).
+    - Publicación con outbox transaccional; consumo idempotente con inbox (`ce_id`) y, en el
+      ingreso, UNIQUE (provider, provider_event_id).
+    - Regla: un pago pasa a CONFIRMED solo tras consultar su estado en la API del PSP, nunca por
+      el webhook solo.
+    - Los consumidores comparan versiones y, ante un hueco, se re-sincronizan con
+      `GET /v1/payments/{paymentId}` (contracts/openapi/payment-service.yaml).
+defaultContentType: application/json
+
+servers:
+  production:
+    host: kafka.receivables.internal:9098
+    protocol: kafka-secure
+    description: Kafka gestionado con TLS y autenticación IAM/SASL; ACL por servicio.
+
+channels:
+  paymentEvents:
+    address: payment.events.v1
+    description: Hechos de pagos y links de pago. Productor único — payment-service.
+    messages:
+      PaymentReceived:
+        $ref: '#/components/messages/PaymentReceived'
+      PaymentConfirmed:
+        $ref: '#/components/messages/PaymentConfirmed'
+      PaymentFailed:
+        $ref: '#/components/messages/PaymentFailed'
+      PaymentReversed:
+        $ref: '#/components/messages/PaymentReversed'
+      PaymentLinkCreated:
+        $ref: '#/components/messages/PaymentLinkCreated'
+      PaymentLinkExpired:
+        $ref: '#/components/messages/PaymentLinkExpired'
+    bindings:
+      kafka:
+        partitions: 12
+        replicas: 3
+        bindingVersion: '0.5.0'
+
+  pspIngress:
+    address: ingress.psp.v1
+    description: Webhooks crudos del PSP (payload del proveedor, retención 3 días). Productor — webhook-ingress; ACL solo para payment-service.
+    messages:
+      PspIngress:
+        $ref: '#/components/messages/PspIngress'
+    bindings:
+      kafka:
+        partitions: 12
+        replicas: 3
+        bindingVersion: '0.5.0'
+
+  bankIngress:
+    address: ingress.bank.v1
+    description: Webhooks crudos del banco (payload del proveedor, retención 3 días). Productor — webhook-ingress; ACL solo para payment-service.
+    messages:
+      BankIngress:
+        $ref: '#/components/messages/BankIngress'
+    bindings:
+      kafka:
+        partitions: 12
+        replicas: 3
+        bindingVersion: '0.5.0'
+
+operations:
+  publishPaymentEvents:
+    action: send
+    channel:
+      $ref: '#/channels/paymentEvents'
+    summary: payment-service publica los hechos de pagos mediante su outbox.
+
+  receivePspIngress:
+    action: receive
+    channel:
+      $ref: '#/channels/pspIngress'
+    summary: |
+      Verifica la firma sobre el cuerpo crudo (webhook-ingress ya la verificó al recibir; aquí
+      se re-verifica y se descarta si no coincide), resuelve el tenant vía cuenta PSP (§7.6) y
+      registra el pago como RECEIVED. Antes de publicar PaymentConfirmed consulta el estado en
+      la API del PSP; el webhook solo nunca confirma.
+    bindings:
+      kafka:
+        groupId:
+          type: string
+          enum: [payment-service]
+        bindingVersion: '0.5.0'
+
+  receiveBankIngress:
+    action: receive
+    channel:
+      $ref: '#/channels/bankIngress'
+    summary: |
+      Ingresa abonos bancarios (CLABE virtual / referencia) como pagos RECEIVED y publica
+      PaymentConfirmed cuando el estado de cuenta o la consulta al banco lo confirman.
+    bindings:
+      kafka:
+        groupId:
+          type: string
+          enum: [payment-service]
+        bindingVersion: '0.5.0'
+
+components:
+  messageBindings:
+    byPaymentId:
+      kafka:
+        key:
+          type: string
+          format: uuid
+          description: paymentId
+        bindingVersion: '0.5.0'
+    byPaymentLinkId:
+      kafka:
+        key:
+          type: string
+          format: uuid
+          description: paymentLinkId
+        bindingVersion: '0.5.0'
+    byProviderEventId:
+      kafka:
+        key:
+          type: string
+          description: providerEventId
+        bindingVersion: '0.5.0'
+
+  messages:
+    PaymentReceived:
+      name: PaymentReceived
+      title: Pago recibido
+      x-ce-type: com.receivables.payment.received.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/PaymentReceivedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byPaymentId'
+    PaymentConfirmed:
+      name: PaymentConfirmed
+      title: Pago confirmado (consulta a la API del PSP, no solo el webhook)
+      x-ce-type: com.receivables.payment.confirmed.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/PaymentConfirmedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byPaymentId'
+    PaymentFailed:
+      name: PaymentFailed
+      title: Pago fallido
+      x-ce-type: com.receivables.payment.failed.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/PaymentFailedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byPaymentId'
+    PaymentReversed:
+      name: PaymentReversed
+      title: Pago revertido o contracargado
+      x-ce-type: com.receivables.payment.reversed.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/PaymentReversedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byPaymentId'
+    PaymentLinkCreated:
+      name: PaymentLinkCreated
+      title: Link de pago creado
+      x-ce-type: com.receivables.payment.link-created.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/PaymentLinkCreatedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byPaymentLinkId'
+    PaymentLinkExpired:
+      name: PaymentLinkExpired
+      title: Link de pago expirado
+      x-ce-type: com.receivables.payment.link-expired.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/PaymentLinkExpiredPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byPaymentLinkId'
+
+    PspIngress:
+      name: PspIngress
+      title: Webhook crudo del PSP (propiedad de webhook-ingress)
+      x-ce-type: com.receivables.ingress.psp.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/PspIngressPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byProviderEventId'
+    BankIngress:
+      name: BankIngress
+      title: Webhook crudo del banco (propiedad de webhook-ingress)
+      x-ce-type: com.receivables.ingress.bank.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/BankIngressPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byProviderEventId'
+
+  schemas:
+    EventHeaders:
+      type: object
+      required: [ce_specversion, ce_id, ce_source, ce_type, ce_time, ce_tenantid, ce_correlationid]
+      properties:
+        ce_specversion:
+          type: string
+          const: '1.0'
+        ce_id:
+          type: string
+          format: uuid
+          description: Id único del mensaje (UUID v7); clave del inbox del consumidor.
+        ce_source:
+          type: string
+          examples: [/payment-service]
+        ce_type:
+          type: string
+          examples: [com.receivables.payment.confirmed.v1]
+        ce_time:
+          type: string
+          format: date-time
+        ce_subject:
+          type: string
+          examples: [payment/0192f5d2-7c1a-7b3e-9f10-2a6c1d4e8b90]
+        ce_tenantid:
+          type: string
+          format: uuid
+        ce_correlationid:
+          type: string
+          description: Agrupa todos los mensajes de un mismo flujo.
+        ce_causationid:
+          type: string
+          description: ce_id del mensaje que causó este.
+        traceparent:
+          type: string
+          description: Contexto W3C Trace Context.
+        content-type:
+          type: string
+          const: application/json
+
+    Uuid:
+      type: string
+      format: uuid
+    Money:
+      type: object
+      additionalProperties: false
+      required: [amount, currency]
+      properties:
+        amount:
+          type: string
+          pattern: '^-?\d{1,15}(\.\d{1,4})?$'
+          description: Decimal exacto como cadena.
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+    PaymentStatus:
+      type: string
+      enum: [RECEIVED, CONFIRMED, FAILED, REVERSED, CHARGED_BACK]
+      description: Coincide letra por letra con el enum del schema Payment de contracts/openapi/payment-service.yaml.
+    PaymentSource:
+      type: string
+      enum: [PSP, BANK, VIRTUAL_ACCOUNT]
+      description: Coincide letra por letra con el enum source del schema Payment de contracts/openapi/payment-service.yaml.
+    PaymentLinkStatus:
+      type: string
+      enum: [ACTIVE, USED, EXPIRED]
+      description: Coincide letra por letra con el enum status del schema PaymentLink de contracts/openapi/payment-service.yaml.
+
+    PaymentReceivedPayload:
+      type: object
+      additionalProperties: false
+      required: [paymentId, customerId, source, amount, receivedAt]
+      properties:
+        paymentId:
+          $ref: '#/components/schemas/Uuid'
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        source:
+          $ref: '#/components/schemas/PaymentSource'
+        providerRef:
+          type: string
+          description: Referencia del proveedor (id PSP / referencia bancaria).
+        amount:
+          $ref: '#/components/schemas/Money'
+        receivedAt:
+          type: string
+          format: date-time
+    PaymentConfirmedPayload:
+      type: object
+      additionalProperties: false
+      required: [paymentId, customerId, source, amount, confirmedAt]
+      properties:
+        paymentId:
+          $ref: '#/components/schemas/Uuid'
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        source:
+          $ref: '#/components/schemas/PaymentSource'
+        providerRef:
+          type: string
+          description: Referencia del proveedor (id PSP / referencia bancaria).
+        amount:
+          $ref: '#/components/schemas/Money'
+        receivedAt:
+          type: string
+          format: date-time
+        confirmedAt:
+          type: string
+          format: date-time
+    PaymentFailedPayload:
+      type: object
+      additionalProperties: false
+      required: [paymentId, customerId, source, amount, reason, failedAt]
+      properties:
+        paymentId:
+          $ref: '#/components/schemas/Uuid'
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        source:
+          $ref: '#/components/schemas/PaymentSource'
+        providerRef:
+          type: string
+          description: Referencia del proveedor (id PSP / referencia bancaria).
+        amount:
+          $ref: '#/components/schemas/Money'
+        reason:
+          type: string
+          description: Motivo reportado por el PSP o el banco (texto corto del proveedor).
+          maxLength: 256
+        failedAt:
+          type: string
+          format: date-time
+    PaymentReversedPayload:
+      type: object
+      additionalProperties: false
+      required: [paymentId, customerId, amount, reason, reversedAt]
+      properties:
+        paymentId:
+          $ref: '#/components/schemas/Uuid'
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        amount:
+          $ref: '#/components/schemas/Money'
+        reason:
+          type: string
+          enum: [CUSTOMER_REQUEST, PSP_DISPUTE, BANK_RECALL, OTHER]
+        reversedAt:
+          type: string
+          format: date-time
+    PaymentLinkCreatedPayload:
+      type: object
+      additionalProperties: false
+      required: [paymentLinkId, caseId, amount, url, status, expiresAt, createdAt]
+      properties:
+        paymentLinkId:
+          $ref: '#/components/schemas/Uuid'
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        token:
+          type: string
+          maxLength: 128
+        amount:
+          $ref: '#/components/schemas/Money'
+        url:
+          type: string
+          format: uri
+        status:
+          $ref: '#/components/schemas/PaymentLinkStatus'
+        expiresAt:
+          type: string
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+    PaymentLinkExpiredPayload:
+      type: object
+      additionalProperties: false
+      required: [paymentLinkId, caseId, expiredAt]
+      properties:
+        paymentLinkId:
+          $ref: '#/components/schemas/Uuid'
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        expiredAt:
+          type: string
+          format: date-time
+
+    PspIngressPayload:
+      type: object
+      additionalProperties: false
+      description: Payload crudo del proveedor, cifrado en reposo en el inbox de webhook-ingress.
+      required: [provider, providerEventId, eventType, receivedAt, rawBody]
+      properties:
+        provider:
+          type: string
+          description: Identificador de la cuenta PSP (rutas a tenant, §7.6).
+        providerEventId:
+          type: string
+          description: Identificador del evento en el proveedor; UNIQUE (provider, provider_event_id).
+        eventType:
+          type: string
+          description: Tipo de evento según la documentación del PSP.
+        receivedAt:
+          type: string
+          format: date-time
+        rawBody:
+          type: object
+          additionalProperties: true
+          description: Cuerpo crudo del webhook, tal como lo emitió el proveedor.
+    BankIngressPayload:
+      type: object
+      additionalProperties: false
+      description: Payload crudo del banco, cifrado en reposo en el inbox de webhook-ingress.
+      required: [provider, providerEventId, eventType, receivedAt, rawBody]
+      properties:
+        provider:
+          type: string
+        providerEventId:
+          type: string
+          description: Identificador del evento en el banco; UNIQUE (provider, provider_event_id).
+        eventType:
+          type: string
+        receivedAt:
+          type: string
+          format: date-time
+        rawBody:
+          type: object
+          additionalProperties: true
+          description: Cuerpo crudo del webhook, tal como lo emitió el banco.
