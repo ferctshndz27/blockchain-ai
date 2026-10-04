@@ -1,0 +1,134 @@
+# Lineamientos de diseño de API (v4 §11). Se ejecuta en CI sobre contracts/openapi/*.yaml:
+#   npx @stoplight/spectral-cli lint contracts/openapi/*.yaml -r contracts/.spectral.yaml
+extends:
+  - [spectral:oas, recommended]
+
+rules:
+  receivables-paths-kebab-case:
+    description: Segmentos de ruta en kebab-case (con método personalizado opcional ':accion'); parámetros en camelCase.
+    severity: error
+    given: $.paths
+    then:
+      field: '@key'
+      function: pattern
+      functionOptions:
+        match: '^(/([a-z0-9]+(-[a-z0-9]+)*(:[a-z]+(-[a-z]+)*)?|\{[a-z][a-zA-Z0-9]*\}))+$'
+
+  receivables-versioned-paths:
+    description: Toda ruta empieza por /v1 (pública) o /internal/v1 (interna).
+    severity: error
+    given: $.paths
+    then:
+      field: '@key'
+      function: pattern
+      functionOptions:
+        match: '^/(internal/)?v[0-9]+/'
+
+  receivables-properties-camel-case:
+    description: Propiedades JSON en camelCase.
+    severity: error
+    given: $..properties[*]~
+    then:
+      function: pattern
+      functionOptions:
+        match: '^[a-z][a-zA-Z0-9]*$'
+
+  receivables-internal-flag:
+    description: Las rutas /internal deben marcarse con x-internal true para que el gateway no las publique.
+    severity: error
+    given: $.paths[?(@property.startsWith('/internal/'))][get,put,post,patch,delete]
+    then:
+      field: x-internal
+      function: truthy
+
+  receivables-post-idempotency-key:
+    description: Todo POST público (no x-internal) exige la cabecera Idempotency-Key.
+    severity: error
+    given: $.paths[*].post
+    then:
+      function: schema
+      functionOptions:
+        schema:
+          if:
+            required: [x-internal]
+            properties:
+              x-internal:
+                const: true
+          then: true
+          else:
+            required: [parameters]
+            properties:
+              parameters:
+                type: array
+                contains:
+                  type: object
+                  required: [name, in]
+                  properties:
+                    name:
+                      const: Idempotency-Key
+                    in:
+                      const: header
+
+  receivables-patch-if-match:
+    description: Todo PATCH exige If-Match (concurrencia optimista).
+    severity: error
+    given: $.paths[*].patch
+    then:
+      function: schema
+      functionOptions:
+        schema:
+          required: [parameters]
+          properties:
+            parameters:
+              type: array
+              contains:
+                type: object
+                required: [name, in]
+                properties:
+                  name:
+                    const: If-Match
+                  in:
+                    const: header
+
+  receivables-errors-problem-json:
+    description: Las respuestas 4xx y 5xx usan application/problem+json (RFC 9457).
+    severity: error
+    given: $.paths[*][*].responses[?(@property >= 400 && @property < 600)]
+    then:
+      function: schema
+      functionOptions:
+        schema:
+          required: [content]
+          properties:
+            content:
+              type: object
+              required: [application/problem+json]
+
+  receivables-no-tenant-in-api:
+    description: El tenant sale del token; nunca como parámetro ni como propiedad del cuerpo.
+    severity: error
+    given:
+      - $..parameters[*].name
+      - $..properties[*]~
+    then:
+      function: pattern
+      functionOptions:
+        notMatch: '/^(organization|org|tenant)(_?id)?$/i'
+
+# Excepciones de diseño documentadas en v4 (§4.1 E3/E4 y ficha S1). Se declaran aquí, por archivo
+# o por ruta, para que las reglas sigan siendo bloqueantes en todo lo demás.
+overrides:
+  - files:
+      - 'openapi/webhook-ingress.yaml'
+    rules:
+      receivables-versioned-paths: off       # /hooks/* son las URL registradas en cada proveedor (E4)
+      receivables-post-idempotency-key: off  # el proveedor no envía Idempotency-Key; dedupe por UNIQUE (provider, provider_event_id)
+  - files:
+      - 'openapi/portal-bff.yaml'
+    rules:
+      receivables-versioned-paths: off       # enlaces cortos /p/{linkToken} del portal del deudor (E3)
+  - files:
+      - 'openapi/identity-service.yaml#/paths/~1.well-known~1jwks.json'
+    rules:
+      receivables-versioned-paths: off       # ubicación fija por RFC 8615 (S1)
+      receivables-paths-kebab-case: off

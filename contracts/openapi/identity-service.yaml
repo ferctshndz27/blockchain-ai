@@ -1,0 +1,471 @@
+openapi: 3.1.0
+info:
+  title: identity-service API
+  version: 0.1.0
+  description: |
+    v0 — Tenancy, membresías, roles y permisos, tokens internos.
+    La autenticación (login, MFA, SSO/SAML) la hace el IdP (WorkOS o Clerk);
+    este servicio gestiona tenancy, autorización y firma de tokens internos.
+    Es dependencia blanda: los demás servicios verifican tokens localmente
+    con el JWKS en caché y su readiness no depende de él.
+    `PUT /v1/organization/autonomy` requiere `If-Match` (optimistic locking)
+    y queda auditado.
+  contact:
+    name: Plataforma (dueño de identity-service)
+  license:
+    name: Propietario
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: http://identity.receivables.svc.cluster.local
+    description: Dentro del clúster (malla con mTLS)
+tags:
+  - name: Organization
+    description: Tenant, configuración y autonomía
+  - name: Members
+    description: Membresías, roles y permisos
+  - name: Internal
+    description: Rutas internas (mTLS)
+security:
+  - contextToken: []
+paths:
+  /v1/organization:
+    get:
+      operationId: getOrganization
+      tags: [Organization]
+      summary: Configuración del tenant
+      responses:
+        '200':
+          description: Tenant actual.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Organization'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common.yaml#/components/responses/Forbidden'
+    patch:
+      operationId: patchOrganization
+      tags: [Organization]
+      summary: Actualiza configuración del tenant (zona horaria, moneda, calendario)
+      parameters:
+        - name: If-Match
+          in: header
+          required: true
+          description: ETag del recurso; evita escritura concurrente.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrganizationPatch'
+      responses:
+        '200':
+          description: Tenant actualizado.
+          headers:
+            ETag:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Organization'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common.yaml#/components/responses/Forbidden'
+        '412':
+          $ref: '../common/common.yaml#/components/responses/PreconditionFailed'
+
+  /v1/organization/autonomy:
+    put:
+      operationId: putAutonomy
+      tags: [Organization]
+      summary: Cambia el nivel de autonomía (L0–L3); auditado
+      description: |
+        `If-Match` obligatorio. El cambio emite `AutonomyLevelChanged`
+        (identity.events.v1), que consume agent-service.
+      parameters:
+        - name: If-Match
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [autonomyLevel, reason]
+              properties:
+                autonomyLevel:
+                  type: string
+                  enum: [L0, L1, L2, L3]
+                reason:
+                  type: string
+                  minLength: 10
+                  maxLength: 2000
+      responses:
+        '200':
+          description: Autonomía actualizada.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [autonomyLevel, changedAt]
+                properties:
+                  autonomyLevel:
+                    type: string
+                    enum: [L0, L1, L2, L3]
+                  changedAt:
+                    type: string
+                    format: date-time
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common.yaml#/components/responses/Forbidden'
+        '412':
+          $ref: '../common/common.yaml#/components/responses/PreconditionFailed'
+
+  /v1/members:
+    get:
+      operationId: listMembers
+      tags: [Members]
+      summary: Lista membresías del tenant
+      parameters:
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: Página de membresías.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemberPage'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+    post:
+      operationId: addMember
+      tags: [Members]
+      summary: Agrega una membresía
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemberCreate'
+      responses:
+        '201':
+          description: Membresía creada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Member'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '409':
+          description: El usuario ya es miembro.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /v1/members/{memberId}:
+    patch:
+      operationId: patchMember
+      tags: [Members]
+      summary: Cambia rol o estado de una membresía
+      parameters:
+        - $ref: '#/components/parameters/MemberId'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemberPatch'
+      responses:
+        '200':
+          description: Membresía actualizada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Member'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+        '412':
+          $ref: '../common/common.yaml#/components/responses/PreconditionFailed'
+
+  /v1/roles:
+    get:
+      operationId: listRoles
+      tags: [Members]
+      summary: Roles y permisos disponibles del tenant
+      responses:
+        '200':
+          description: Roles del tenant.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [roles]
+                properties:
+                  roles:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Role'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+
+  /internal/v1/token-exchange:
+    post:
+      operationId: tokenExchange
+      tags: [Internal]
+      summary: Token del IdP → token de contexto (5 min, aud por servicio)
+      description: |
+        El gateway intercambia el token del IdP por un token de contexto
+        firmado por identity-service con `userId`, `tenantId` y `roles`.
+      x-internal: true
+      security:
+        - serviceToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [idpToken, service]
+              properties:
+                idpToken:
+                  type: string
+                service:
+                  type: string
+      responses:
+        '200':
+          description: Token de contexto emitido.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [contextToken, expiresAt]
+                properties:
+                  contextToken:
+                    type: string
+                  expiresAt:
+                    type: string
+                    format: date-time
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+
+  /internal/v1/capability-tokens:
+    post:
+      operationId: issueCapabilityToken
+      tags: [Internal]
+      summary: Token de capacidad del agente acotado a (tenant, caso, permisos)
+      x-internal: true
+      security:
+        - serviceToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [agentId, caseId, scopes, ttlSeconds]
+              properties:
+                agentId:
+                  type: string
+                caseId:
+                  $ref: '#/components/schemas/Uuid'
+                scopes:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: string
+                ttlSeconds:
+                  type: integer
+                  minimum: 60
+                  maximum: 3600
+      responses:
+        '201':
+          description: Token de capacidad emitido.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [token, expiresAt]
+                properties:
+                  token:
+                    type: string
+                  expiresAt:
+                    type: string
+                    format: date-time
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+
+  /.well-known/jwks.json:
+    get:
+      operationId: getJwks
+      tags: [Internal]
+      summary: Claves públicas (JWKS) para verificación local de tokens
+      x-internal: true
+      security:
+        - serviceToken: []
+      responses:
+        '200':
+          description: JWKS.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common.yaml#/components/responses/Forbidden'
+components:
+  securitySchemes:
+    contextToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/contextToken'
+    serviceToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/serviceToken'
+  parameters:
+    MemberId:
+      name: memberId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    IdempotencyKey:
+      $ref: '../common/common.yaml#/components/parameters/IdempotencyKey'
+    IfMatch:
+      $ref: '../common/common.yaml#/components/parameters/IfMatch'
+  schemas:
+    Uuid:
+      $ref: '../common/common.yaml#/components/schemas/Uuid'
+    PageInfo:
+      $ref: '../common/common.yaml#/components/schemas/PageInfo'
+    Problem:
+      $ref: '../common/common.yaml#/components/schemas/Problem'
+    Organization:
+      type: object
+      additionalProperties: false
+      required: [name, timezone, currency, autonomyLevel]
+      properties:
+        name:
+          type: string
+          maxLength: 200
+        timezone:
+          type: string
+          examples: [America/Mexico_City]
+        currency:
+          type: string
+          examples: [MXN]
+        autonomyLevel:
+          type: string
+          enum: [L0, L1, L2, L3]
+        etag:
+          type: string
+    OrganizationPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          maxLength: 200
+        timezone:
+          type: string
+        currency:
+          type: string
+    MemberPage:
+      type: object
+      additionalProperties: false
+      required: [items, pageInfo]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Member'
+        pageInfo:
+          $ref: '#/components/schemas/PageInfo'
+    Member:
+      type: object
+      additionalProperties: false
+      required: [memberId, userId, status]
+      properties:
+        memberId:
+          $ref: '#/components/schemas/Uuid'
+        userId:
+          type: string
+        displayName:
+          type: string
+          maxLength: 200
+        role:
+          type: string
+        status:
+          type: string
+          enum: [ACTIVE, INVITED, SUSPENDED, REMOVED]
+        createdAt:
+          type: string
+          format: date-time
+        etag:
+          type: string
+          description: Versión de la membresía; se envía en `If-Match` al modificarla.
+    MemberCreate:
+      type: object
+      additionalProperties: false
+      required: [userId, role]
+      properties:
+        userId:
+          type: string
+        role:
+          type: string
+    MemberPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        role:
+          type: string
+        status:
+          type: string
+          enum: [ACTIVE, SUSPENDED, REMOVED]
+    Role:
+      type: object
+      additionalProperties: false
+      required: [name, permissions]
+      properties:
+        name:
+          type: string
+        permissions:
+          type: array
+          items:
+            type: string

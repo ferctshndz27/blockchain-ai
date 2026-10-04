@@ -1,0 +1,334 @@
+openapi: 3.1.0
+info:
+  title: dispute-service API
+  version: 0.1.0
+  description: |
+    v0 — F2. Disputas: tipo, facturas afectadas, evidencia (referencias a
+    documentos), SLA y resolución.
+    Comandos: dispute.commands.v1 (OpenDispute).
+    Publica: dispute.events.v1 (DisputeOpened, DisputeEvidenceAdded,
+    DisputeResolved, DisputeWithdrawn).
+    Consume: invoice (CreditNoteIssued → vincula la resolución aceptada).
+    En F1 no existe este servicio: la detección pausa las facturas en
+    case-service (CasePaused, motivo DISPUTE) y task-service crea la tarea.
+  contact:
+    name: Equipo Conversación e IA (dueño de dispute-service)
+  license:
+    name: Propietario
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: http://dispute.receivables.svc.cluster.local
+    description: Dentro del clúster (malla con mTLS)
+tags:
+  - name: Disputes
+    description: Disputas de clientes
+security:
+  - contextToken: []
+paths:
+  /v1/disputes:
+    get:
+      operationId: listDisputes
+      tags: [Disputes]
+      summary: Lista disputas
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/DisputeStatus'
+      responses:
+        '200':
+          description: Página de disputas.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DisputePage'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+
+  /v1/cases/{caseId}/disputes:
+    post:
+      operationId: openDispute
+      tags: [Disputes]
+      summary: Abre una disputa en un caso
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DisputeCreate'
+      responses:
+        '201':
+          description: Disputa abierta.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Dispute'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+  /v1/disputes/{disputeId}:
+    get:
+      operationId: getDispute
+      tags: [Disputes]
+      summary: Detalle de una disputa
+      parameters:
+        - name: disputeId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+      responses:
+        '200':
+          description: Disputa.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Dispute'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+    patch:
+      operationId: updateDispute
+      tags: [Disputes]
+      summary: Actualiza metadatos de la disputa (If-Match)
+      parameters:
+        - name: disputeId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                notes:
+                  type: string
+                  maxLength: 4000
+      responses:
+        '200':
+          description: Disputa actualizada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Dispute'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/PreconditionFailed'
+
+  /v1/disputes/{disputeId}/evidence:
+    post:
+      operationId: addDisputeEvidence
+      tags: [Disputes]
+      summary: Vincula evidencia (referencia a documento) a la disputa
+      parameters:
+        - name: disputeId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [documentId]
+              properties:
+                documentId:
+                  $ref: '#/components/schemas/Uuid'
+      responses:
+        '201':
+          description: Evidencia vinculada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DisputeEvidence'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+  /v1/disputes/{disputeId}/resolve:
+    post:
+      operationId: resolveDispute
+      tags: [Disputes]
+      summary: Resuelve una disputa (If-Match)
+      parameters:
+        - name: disputeId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DisputeResolution'
+      responses:
+        '200':
+          description: Disputa resuelta.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Dispute'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/PreconditionFailed'
+
+components:
+  securitySchemes:
+    contextToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/contextToken'
+  parameters:
+    CaseId:
+      name: caseId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    IdempotencyKey:
+      $ref: '../common/common.yaml#/components/parameters/IdempotencyKey'
+    IfMatch:
+      $ref: '../common/common.yaml#/components/parameters/IfMatch'
+    Cursor:
+      $ref: '../common/common.yaml#/components/parameters/Cursor'
+    Limit:
+      $ref: '../common/common.yaml#/components/parameters/Limit'
+  schemas:
+    Uuid:
+      $ref: '../common/common.yaml#/components/schemas/Uuid'
+    Money:
+      $ref: '../common/common.yaml#/components/schemas/Money'
+    PageInfo:
+      $ref: '../common/common.yaml#/components/schemas/PageInfo'
+    DisputeType:
+      type: string
+      enum: [AMOUNT, DUPLICATED_INVOICE, ALREADY_PAID, SERVICE, OTHER]
+    DisputeStatus:
+      type: string
+      enum: [OPEN, IN_REVIEW, RESOLVED, WITHDRAWN]
+    Dispute:
+      type: object
+      additionalProperties: false
+      required: [disputeId, caseId, type, status, version]
+      properties:
+        disputeId:
+          $ref: '#/components/schemas/Uuid'
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        type:
+          $ref: '#/components/schemas/DisputeType'
+        status:
+          $ref: '#/components/schemas/DisputeStatus'
+        affectedInvoices:
+          type: array
+          items:
+            $ref: '#/components/schemas/Uuid'
+        amount:
+          $ref: '#/components/schemas/Money'
+        slaDueAt:
+          type: string
+          format: date-time
+        resolution:
+          $ref: '#/components/schemas/DisputeResolution'
+        evidence:
+          type: array
+          items:
+            $ref: '#/components/schemas/DisputeEvidence'
+        version:
+          type: integer
+          minimum: 1
+        openedAt:
+          type: string
+          format: date-time
+        resolvedAt:
+          type: string
+          format: date-time
+    DisputeCreate:
+      type: object
+      additionalProperties: false
+      required: [type, affectedInvoices]
+      properties:
+        type:
+          $ref: '#/components/schemas/DisputeType'
+        affectedInvoices:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/Uuid'
+        amount:
+          $ref: '#/components/schemas/Money'
+        notes:
+          type: string
+          maxLength: 4000
+    DisputeEvidence:
+      type: object
+      additionalProperties: false
+      required: [documentId, addedAt]
+      properties:
+        documentId:
+          $ref: '#/components/schemas/Uuid'
+        addedBy:
+          $ref: '../common/common.yaml#/components/schemas/Actor'
+        addedAt:
+          type: string
+          format: date-time
+    DisputeResolution:
+      type: object
+      additionalProperties: false
+      required: [outcome]
+      properties:
+        outcome:
+          type: string
+          enum: [CLIENT_ACCEPTED, PARTIAL_CREDIT, NO_CREDIT, ESCALATED]
+        creditNoteId:
+          $ref: '#/components/schemas/Uuid'
+        notes:
+          type: string
+          maxLength: 4000
+    DisputePage:
+      type: object
+      additionalProperties: false
+      required: [items, pageInfo]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Dispute'
+        pageInfo:
+          $ref: '#/components/schemas/PageInfo'

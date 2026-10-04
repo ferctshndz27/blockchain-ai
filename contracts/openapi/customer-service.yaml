@@ -1,0 +1,559 @@
+openapi: 3.1.0
+info:
+  title: customer-service API
+  version: 0.1.0
+  description: |
+    v0 — Clientes deudores, contactos, verificación de contactos, fusión de
+    duplicados y segmentos.
+    Publica: customer.events.v1 (CustomerCreated, CustomerUpdated,
+    CustomersMerged, ContactAdded, ContactUpdated, ContactVerified).
+  contact:
+    name: Equipo Conversación e IA (dueño de customer-service)
+  license:
+    name: Propietario
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: http://customer.receivables.svc.cluster.local
+    description: Dentro del clúster (malla con mTLS)
+tags:
+  - name: Customers
+    description: Clientes deudores
+  - name: Contacts
+    description: Contactos y verificación
+  - name: Internal
+    description: Rutas internas (mTLS + token de servicio)
+security:
+  - contextToken: []
+paths:
+  /v1/customers:
+    get:
+      operationId: listCustomers
+      tags: [Customers]
+      summary: Lista clientes del tenant
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: segment
+          in: query
+          required: false
+          description: Filtra por segmento.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Página de clientes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomerPage'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+    post:
+      operationId: createCustomer
+      tags: [Customers]
+      summary: Crea un cliente deudor
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomerCreate'
+      responses:
+        '201':
+          description: Cliente creado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Customer'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/Conflict'
+
+  /v1/customers/{customerId}:
+    get:
+      operationId: getCustomer
+      tags: [Customers]
+      summary: Detalle de un cliente
+      parameters:
+        - $ref: '#/components/parameters/CustomerId'
+      responses:
+        '200':
+          description: Cliente.
+          headers:
+            ETag:
+              $ref: '../common/common.yaml#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Customer'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+    patch:
+      operationId: patchCustomer
+      tags: [Customers]
+      summary: Actualiza un cliente (If-Match)
+      parameters:
+        - $ref: '#/components/parameters/CustomerId'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomerPatch'
+      responses:
+        '200':
+          description: Cliente actualizado.
+          headers:
+            ETag:
+              $ref: '../common/common.yaml#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Customer'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/PreconditionFailed'
+
+  /v1/customers/{customerId}/merge:
+    post:
+      operationId: mergeCustomers
+      tags: [Customers]
+      summary: Fusiona duplicados (If-Match sobre el cliente destino)
+      description: |
+        Fusiona `sourceCustomerId` en `customerId` (destino). Emite
+        `CustomersMerged`. No es conmutativa: el destino es inmutable.
+      parameters:
+        - $ref: '#/components/parameters/CustomerId'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [sourceCustomerId]
+              properties:
+                sourceCustomerId:
+                  $ref: '#/components/schemas/Uuid'
+                strategy:
+                  type: string
+                  enum: [KEEP_DESTINATION, KEEP_SOURCE]
+                  default: KEEP_DESTINATION
+      responses:
+        '200':
+          description: Fusión completada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Customer'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/PreconditionFailed'
+
+  /v1/customers/{customerId}/contacts:
+    get:
+      operationId: listContacts
+      tags: [Contacts]
+      summary: Lista contactos del cliente
+      parameters:
+        - $ref: '#/components/parameters/CustomerId'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Página de contactos.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContactPage'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+    post:
+      operationId: addContact
+      tags: [Contacts]
+      summary: Agrega un contacto al cliente
+      parameters:
+        - $ref: '#/components/parameters/CustomerId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ContactCreate'
+      responses:
+        '201':
+          description: Contacto creado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Contact'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/Conflict'
+
+  /v1/contacts/{contactId}:
+    patch:
+      operationId: patchContact
+      tags: [Contacts]
+      summary: Actualiza un contacto (If-Match)
+      parameters:
+        - name: contactId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ContactPatch'
+      responses:
+        '200':
+          description: Contacto actualizado.
+          headers:
+            ETag:
+              $ref: '../common/common.yaml#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Contact'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/PreconditionFailed'
+
+  /v1/contacts/{contactId}/verification:
+    post:
+      operationId: verifyContact
+      tags: [Contacts]
+      summary: Verifica un contacto (código OTP o firma del proveedor)
+      parameters:
+        - name: contactId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [method]
+              properties:
+                method:
+                  type: string
+                  enum: [OTP, PROVIDER, MANUAL]
+                otp:
+                  type: string
+                  minLength: 4
+                  maxLength: 8
+      responses:
+        '200':
+          description: Contacto verificado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Contact'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/Conflict'
+
+  /internal/v1/contact-matches:
+    get:
+      operationId: contactMatches
+      tags: [Internal]
+      summary: Busca contactos por teléfono o email (0, 1 o N con sus clientes)
+      description: |
+        Usado por conversation-service para enrutar mensajes entrantes.
+        `phone` o `email` (exclusivo).
+      x-internal: true
+      security:
+        - serviceToken: []
+      parameters:
+        - name: phone
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: email
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Matches (vacío si no hay ninguno).
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [matches]
+                properties:
+                  matches:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ContactMatch'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+
+  /internal/v1/customers:batch-upsert:
+    post:
+      operationId: batchUpsertCustomers
+      tags: [Internal]
+      summary: Upsert idempotente por (source, externalId) o RFC
+      x-internal: true
+      security:
+        - serviceToken: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [source, records]
+              properties:
+                source:
+                  type: string
+                  description: Origen del lote (p. ej. erp, import-csv).
+                records:
+                  type: array
+                  minItems: 1
+                  maxItems: 1000
+                  items:
+                    $ref: '#/components/schemas/CustomerUpsert'
+      responses:
+        '200':
+          description: Resultados del lote.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [applied, skipped]
+                properties:
+                  applied:
+                    type: integer
+                  skipped:
+                    type: integer
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+
+components:
+  securitySchemes:
+    contextToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/contextToken'
+    serviceToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/serviceToken'
+  parameters:
+    CustomerId:
+      name: customerId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    IdempotencyKey:
+      $ref: '../common/common.yaml#/components/parameters/IdempotencyKey'
+    IfMatch:
+      $ref: '../common/common.yaml#/components/parameters/IfMatch'
+    Cursor:
+      $ref: '../common/common.yaml#/components/parameters/Cursor'
+    Limit:
+      $ref: '../common/common.yaml#/components/parameters/Limit'
+  schemas:
+    Uuid:
+      $ref: '../common/common.yaml#/components/schemas/Uuid'
+    PageInfo:
+      $ref: '../common/common.yaml#/components/schemas/PageInfo'
+    Customer:
+      type: object
+      additionalProperties: false
+      required: [customerId, name, version]
+      properties:
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          type: string
+          maxLength: 300
+        rfc:
+          type: string
+          maxLength: 13
+        segment:
+          type: string
+        version:
+          type: integer
+          minimum: 1
+        createdAt:
+          type: string
+          format: date-time
+    CustomerCreate:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          maxLength: 300
+        rfc:
+          type: string
+          maxLength: 13
+        segment:
+          type: string
+    CustomerPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          maxLength: 300
+        segment:
+          type: string
+    CustomerUpsert:
+      type: object
+      additionalProperties: false
+      required: [externalId, name]
+      properties:
+        externalId:
+          type: string
+          maxLength: 128
+        name:
+          type: string
+          maxLength: 300
+        rfc:
+          type: string
+          maxLength: 13
+    CustomerPage:
+      type: object
+      additionalProperties: false
+      required: [items, pageInfo]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Customer'
+        pageInfo:
+          $ref: '#/components/schemas/PageInfo'
+    Contact:
+      type: object
+      additionalProperties: false
+      required: [contactId, customerId, channel, value, verificationStatus, version]
+      properties:
+        contactId:
+          $ref: '#/components/schemas/Uuid'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        channel:
+          type: string
+          enum: [WHATSAPP, PHONE, EMAIL, MESSENGER, IN_APP]
+        value:
+          type: string
+          maxLength: 254
+        label:
+          type: string
+          maxLength: 200
+        preferred:
+          type: boolean
+          default: false
+        verificationStatus:
+          type: string
+          enum: [UNVERIFIED, PENDING, VERIFIED, FAILED]
+        verifiedAt:
+          type: string
+          format: date-time
+        version:
+          type: integer
+          minimum: 1
+    ContactCreate:
+      type: object
+      additionalProperties: false
+      required: [channel, value]
+      properties:
+        channel:
+          type: string
+          enum: [WHATSAPP, PHONE, EMAIL, MESSENGER, IN_APP]
+        value:
+          type: string
+          maxLength: 254
+        label:
+          type: string
+          maxLength: 200
+        preferred:
+          type: boolean
+          default: false
+    ContactPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        value:
+          type: string
+          maxLength: 254
+        label:
+          type: string
+          maxLength: 200
+        preferred:
+          type: boolean
+    ContactPage:
+      type: object
+      additionalProperties: false
+      required: [items, pageInfo]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Contact'
+        pageInfo:
+          $ref: '#/components/schemas/PageInfo'
+    ContactMatch:
+      type: object
+      additionalProperties: false
+      required: [contactId, customerId, channel, value]
+      properties:
+        contactId:
+          $ref: '#/components/schemas/Uuid'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        channel:
+          type: string
+          enum: [WHATSAPP, PHONE, EMAIL, MESSENGER, IN_APP]
+        value:
+          type: string
+        customerName:
+          type: string
+          maxLength: 300

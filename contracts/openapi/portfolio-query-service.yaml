@@ -1,0 +1,255 @@
+openapi: 3.1.0
+info:
+  title: portfolio-query-service API
+  version: 0.1.0
+  description: |
+    v0 — Vista de solo lectura del portafolio para dashboards, reportes y
+    exports. Proyecta eventos de los dominios (read-models) con lag medido y
+    sin escribir en dominios ajenos.
+    Publica: portfolio.events.v1 (PortfolioProjectionRebuilt,
+    ProjectionLagDetected).
+  contact:
+    name: Equipo Conversación e IA (dueño de portfolio-query)
+  license:
+    name: Propietario
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: http://portfolio-query.receivables.svc.cluster.local
+    description: Dentro del clúster (malla con mTLS)
+tags:
+  - name: Portfolio
+    description: Métricas y vistas del portafolio
+  - name: Exports
+    description: Exportaciones asincrónicas
+security:
+  - contextToken: []
+paths:
+  /v1/portfolio/overview:
+    get:
+      operationId: getPortfolioOverview
+      tags: [Portfolio]
+      summary: Resumen agregado del portafolio (saldo, casos, recuperación)
+      parameters:
+        - name: asOf
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: Resumen agregado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PortfolioOverview'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+
+  /v1/portfolio/aging:
+    get:
+      operationId: getAgingReport
+      tags: [Portfolio]
+      summary: Envejecimiento por buckets de días de atraso
+      responses:
+        '200':
+          description: Distribución por buckets de envejecimiento.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgingReport'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+
+  /v1/portfolio/recovery:
+    get:
+      operationId: getRecoveryReport
+      tags: [Portfolio]
+      summary: Tasa de recuperación (pagos confirmados vs. cobrados)
+      parameters:
+        - name: from
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+        - name: to
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+      responses:
+        '200':
+          description: Métricas de recuperación.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoveryReport'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+
+  /v1/portfolio/exports:
+    post:
+      operationId: createExport
+      tags: [Exports]
+      summary: Solicita una exportación asincrónica (CSV)
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExportRequest'
+      responses:
+        '202':
+          description: Exportación en cola.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Export'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+
+  /v1/portfolio/exports/{exportId}:
+    get:
+      operationId: getExport
+      tags: [Exports]
+      summary: Estado y URL firmada de una exportación
+      parameters:
+        - name: exportId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+      responses:
+        '200':
+          description: Estado de la exportación.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Export'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    contextToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/contextToken'
+  parameters:
+    IdempotencyKey:
+      $ref: '../common/common.yaml#/components/parameters/IdempotencyKey'
+  schemas:
+    Uuid:
+      $ref: '../common/common.yaml#/components/schemas/Uuid'
+    Money:
+      $ref: '../common/common.yaml#/components/schemas/Money'
+    PortfolioOverview:
+      type: object
+      additionalProperties: false
+      required: [outstanding, openCases, recoveredInWindow]
+      properties:
+        asOf:
+          type: string
+          format: date-time
+        outstanding:
+          $ref: '#/components/schemas/Money'
+        openCases:
+          type: integer
+          minimum: 0
+        recoveredInWindow:
+          $ref: '#/components/schemas/Money'
+        projectionLagSeconds:
+          type: integer
+          minimum: 0
+    AgingReport:
+      type: object
+      additionalProperties: false
+      required: [buckets]
+      properties:
+        asOf:
+          type: string
+          format: date-time
+        buckets:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [label, outstanding]
+            properties:
+              label:
+                type: string
+              daysFrom:
+                type: integer
+                minimum: 0
+              daysTo:
+                type: integer
+                minimum: 0
+              outstanding:
+                $ref: '#/components/schemas/Money'
+    RecoveryReport:
+      type: object
+      additionalProperties: false
+      required: [window, recovered, charged]
+      properties:
+        window:
+          type: object
+          additionalProperties: false
+          required: [from, to]
+          properties:
+            from:
+              type: string
+              format: date
+            to:
+              type: string
+              format: date
+        recovered:
+          $ref: '#/components/schemas/Money'
+        charged:
+          $ref: '#/components/schemas/Money'
+        recoveryRate:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+    Export:
+      type: object
+      additionalProperties: false
+      required: [exportId, kind, status, createdAt]
+      properties:
+        exportId:
+          $ref: '#/components/schemas/Uuid'
+        kind:
+          type: string
+          enum: [AGING, OVERVIEW, CASES]
+        status:
+          type: string
+          enum: [QUEUED, RUNNING, COMPLETED, FAILED]
+        downloadUrl:
+          type: [string, 'null']
+          format: uri
+        createdAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: string
+          format: date-time
+    ExportRequest:
+      type: object
+      additionalProperties: false
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [AGING, OVERVIEW, CASES]
+        format:
+          type: string
+          enum: [CSV]
+          default: CSV

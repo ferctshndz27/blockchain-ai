@@ -1,0 +1,205 @@
+openapi: 3.1.0
+info:
+  title: portal-bff API
+  version: 0.1.0
+  description: |
+    v0 — Portal del deudor sin login, con enlace firmado de vida corta.
+    Token opaco no enumerable; alcance (tenant, cliente, facturas), expiración.
+    Validado en payment-service; rate limit estricto por IP y por token.
+  contact:
+    name: Equipo Conversación e IA (dueño de portal-bff)
+  license:
+    name: Propietario
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: http://portal-bff.receivables.svc.cluster.local
+    description: Dentro del clúster (malla con mTLS)
+tags:
+  - name: Portal
+    description: Rutas de enlace firmado /p/{linkToken}
+security: []
+paths:
+  /p/{linkToken}:
+    get:
+      operationId: getPortalPage
+      tags: [Portal]
+      summary: Saldo y facturas incluidas en el enlace
+      parameters:
+        - name: linkToken
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 32
+            maxLength: 128
+      responses:
+        '200':
+          description: Datos del enlace.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PortalPage'
+        '404':
+          description: Token inválido, expirado o sin facturas.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /p/{linkToken}/payment-intents:
+    post:
+      operationId: createPaymentIntent
+      tags: [Portal]
+      summary: Crea un payment-intent (delega en payment-service)
+      parameters:
+        - $ref: '../common/common.yaml#/components/parameters/IdempotencyKey'
+        - name: linkToken
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '201':
+          description: Payment intent creado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentIntentCreated'
+        '404':
+          description: Token inválido o expirado.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: Ya existe un payment intent activo para estas facturas.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /p/{linkToken}/documents:
+    post:
+      operationId: uploadDocument
+      tags: [Portal]
+      summary: Sube un documento (delega en document-service)
+      parameters:
+        - $ref: '../common/common.yaml#/components/parameters/IdempotencyKey'
+        - name: linkToken
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '202':
+          description: Upload iniciado; devuelve uploadId.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentUploadStarted'
+        '404':
+          description: Token inválido o expirado.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /p/{linkToken}/disputes:
+    post:
+      operationId: fileDispute
+      tags: [Portal]
+      summary: Registra una disputa (F2, delega en dispute-service)
+      parameters:
+        - $ref: '../common/common.yaml#/components/parameters/IdempotencyKey'
+        - name: linkToken
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '201':
+          description: Disputa registrada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DisputeFiled'
+        '404':
+          description: Token inválido o expirado.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+components:
+  schemas:
+    Problem:
+      $ref: '../common/common.yaml#/components/schemas/Problem'
+    Uuid:
+      $ref: '../common/common.yaml#/components/schemas/Uuid'
+    Money:
+      $ref: '../common/common.yaml#/components/schemas/Money'
+    PortalPage:
+      type: object
+      additionalProperties: false
+      required: [balance, invoices, expiresAt]
+      properties:
+        balance:
+          $ref: '#/components/schemas/Money'
+        invoices:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/PortalInvoice'
+        expiresAt:
+          type: string
+          format: date-time
+    PortalInvoice:
+      type: object
+      additionalProperties: false
+      required: [invoiceId, amount, dueDate, status]
+      properties:
+        invoiceId:
+          $ref: '#/components/schemas/Uuid'
+        amount:
+          $ref: '#/components/schemas/Money'
+        dueDate:
+          type: string
+          format: date
+        status:
+          type: string
+          enum: [OPEN, PARTIALLY_PAID, PAID, CANCELLED]
+    PaymentIntentCreated:
+      type: object
+      additionalProperties: false
+      required: [paymentIntentId, status, amount]
+      properties:
+        paymentIntentId:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          type: string
+          enum: [PENDING, PROCESSING, SUCCEEDED, FAILED, CANCELLED]
+        amount:
+          $ref: '#/components/schemas/Money'
+    DocumentUploadStarted:
+      type: object
+      additionalProperties: false
+      required: [uploadId, uploadUrl, expiresAt]
+      properties:
+        uploadId:
+          $ref: '#/components/schemas/Uuid'
+        uploadUrl:
+          type: string
+          format: uri
+        expiresAt:
+          type: string
+          format: date-time
+    DisputeFiled:
+      type: object
+      additionalProperties: false
+      required: [disputeId, status]
+      properties:
+        disputeId:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          type: string
+          enum: [OPEN, IN_REVIEW, RESOLVED, WITHDRAWN]

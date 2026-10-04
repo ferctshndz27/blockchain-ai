@@ -1,0 +1,774 @@
+openapi: 3.1.0
+info:
+  title: case-service
+  version: 1.0.0
+  description: |
+    Expedientes de cobranza: estado, pausas, takeover, línea de tiempo y permisos de contacto firmados.
+    Dueño de la invariante "no contactar si el caso está pausado, en takeover o cerrado".
+
+    Las operaciones marcadas con `x-internal: true` (rutas `/internal/v1`) no se publican en el API Gateway:
+    solo se llaman dentro de la malla, con mTLS y token de servicio.
+  contact:
+    name: Equipo Cobranza (dueño de case-service)
+  license:
+    name: Propietario
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: http://case-service.receivables.svc.cluster.local
+    description: Dentro del clúster (malla con mTLS)
+tags:
+  - name: Cases
+    description: API pública (consumida por web-bff)
+  - name: Internal
+    description: API interna entre servicios
+security:
+  - contextToken: []
+paths:
+  /v1/cases/{caseId}:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+    get:
+      operationId: getCase
+      tags: [Cases]
+      summary: Obtener un caso
+      description: Devuelve el caso y su versión en la cabecera ETag. Los saldos los expone ledger-service.
+      responses:
+        '200':
+          $ref: '#/components/responses/CaseOk'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      operationId: updateCase
+      tags: [Cases]
+      summary: Cambiar asignación o prioridad
+      description: No permite cambiar el estado; para eso existen las acciones explícitas.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: '#/components/schemas/CasePatch'
+      responses:
+        '200':
+          $ref: '#/components/responses/CaseOk'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+
+  /v1/cases/{caseId}/pause:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+    post:
+      operationId: pauseCase
+      tags: [Cases]
+      summary: Pausar la cobranza del caso o de algunas facturas
+      description: Con invoiceIds se pausan solo esas facturas (p. ej. las disputadas); sin ellas, todo el caso.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PauseRequest'
+      responses:
+        '200':
+          $ref: '#/components/responses/CaseOk'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+
+  /v1/cases/{caseId}/resume:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+    post:
+      operationId: resumeCase
+      tags: [Cases]
+      summary: Reanudar la cobranza
+      description: Quita la pausa del caso o de sus facturas. No reanuda facturas con disputa abierta.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NoteRequest'
+      responses:
+        '200':
+          $ref: '#/components/responses/CaseOk'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+
+  /v1/cases/{caseId}/escalate:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+    post:
+      operationId: escalateCase
+      tags: [Cases]
+      summary: Escalar el caso a una persona
+      description: Desde ESCALATED solo una persona puede mover el caso; el agente no.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EscalateRequest'
+      responses:
+        '200':
+          $ref: '#/components/responses/CaseOk'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+
+  /v1/cases/{caseId}/takeover:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+    post:
+      operationId: takeOverCase
+      tags: [Cases]
+      summary: Tomar el control humano de la conversación
+      description: El agente deja de actuar en el caso hasta que se libere con /release.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NoteRequest'
+      responses:
+        '200':
+          $ref: '#/components/responses/CaseOk'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+
+  /v1/cases/{caseId}/release:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+    post:
+      operationId: releaseCase
+      tags: [Cases]
+      summary: Devolver el control al agente
+      description: Termina el takeover humano; el agente vuelve a actuar según el nivel de autonomía.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200':
+          $ref: '#/components/responses/CaseOk'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+
+  /v1/cases/{caseId}/close:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+    post:
+      operationId: closeCase
+      tags: [Cases]
+      summary: Cerrar el caso
+      description: Cierre manual con motivo. El cierre por pago lo hace el sistema al llegar el saldo a cero.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CloseRequest'
+      responses:
+        '200':
+          $ref: '#/components/responses/CaseOk'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+
+  /v1/cases/{caseId}/timeline:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+    get:
+      operationId: listCaseTimeline
+      tags: [Cases]
+      summary: Línea de tiempo del caso
+      description: Eventos propios del caso con referencias a las entidades de otros servicios.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Entradas en orden cronológico inverso.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TimelinePage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /internal/v1/cases/{caseId}/context:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+    get:
+      operationId: getCaseContext
+      tags: [Internal]
+      summary: Snapshot del caso para el agente
+      description: Requiere un token de capacidad cuyo alcance incluya este caso.
+      x-internal: true
+      security:
+        - serviceToken: []
+      responses:
+        '200':
+          description: Snapshot con la versión que el agente debe enviar como expectedVersion.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseContext'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /internal/v1/cases/{caseId}/outbound-permits:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+    post:
+      operationId: createOutboundPermit
+      tags: [Internal]
+      summary: Emitir un permiso de contacto firmado
+      description: |
+        Devuelve un JWS de vida corta (60 s) si el caso está en la versión esperada y no está pausado,
+        en takeover ni cerrado. Quien envía debe fallar cerrado si no obtiene el permiso.
+      x-internal: true
+      security:
+        - serviceToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OutboundPermitRequest'
+      responses:
+        '201':
+          description: Permiso emitido.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OutboundPermit'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            Permiso denegado. `code`: CASE_VERSION_MISMATCH, CASE_PAUSED, TAKEOVER_ACTIVE, CASE_CLOSED o INVOICES_PAUSED.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+
+  /internal/v1/customers/{customerId}/active-case:
+    parameters:
+      - name: customerId
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Uuid'
+    get:
+      operationId: getActiveCaseForCustomer
+      tags: [Internal]
+      summary: Caso activo de un cliente
+      description: Usado por conversation-service para enrutar mensajes entrantes.
+      x-internal: true
+      security:
+        - serviceToken: []
+      responses:
+        '200':
+          description: Caso activo.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActiveCase'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /internal/v1/permit-keys:
+    get:
+      operationId: getPermitKeys
+      tags: [Internal]
+      summary: Claves públicas para verificar permisos (JWKS)
+      description: Los ejecutores (conversation-service, agreement-service) las cachean y rotan por kid.
+      x-internal: true
+      security:
+        - serviceToken: []
+      responses:
+        '200':
+          description: JWK Set (RFC 7517).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Jwks'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+components:
+  securitySchemes:
+    contextToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/contextToken'
+    serviceToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/serviceToken'
+
+  parameters:
+    CaseId:
+      name: caseId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    IdempotencyKey:
+      $ref: '../common/common.yaml#/components/parameters/IdempotencyKey'
+    IfMatch:
+      $ref: '../common/common.yaml#/components/parameters/IfMatch'
+    Cursor:
+      $ref: '../common/common.yaml#/components/parameters/Cursor'
+    Limit:
+      $ref: '../common/common.yaml#/components/parameters/Limit'
+
+  responses:
+    CaseOk:
+      description: Caso actualizado.
+      headers:
+        ETag:
+          $ref: '../common/common.yaml#/components/headers/ETag'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Case'
+    Unauthorized:
+      $ref: '../common/common.yaml#/components/responses/Unauthorized'
+    Forbidden:
+      $ref: '../common/common.yaml#/components/responses/Forbidden'
+    NotFound:
+      $ref: '../common/common.yaml#/components/responses/NotFound'
+    Conflict:
+      $ref: '../common/common.yaml#/components/responses/Conflict'
+    PreconditionFailed:
+      $ref: '../common/common.yaml#/components/responses/PreconditionFailed'
+    PreconditionRequired:
+      $ref: '../common/common.yaml#/components/responses/PreconditionRequired'
+    UnprocessableContent:
+      $ref: '../common/common.yaml#/components/responses/UnprocessableContent'
+
+  schemas:
+    Uuid:
+      $ref: '../common/common.yaml#/components/schemas/Uuid'
+    Actor:
+      $ref: '../common/common.yaml#/components/schemas/Actor'
+    PageInfo:
+      $ref: '../common/common.yaml#/components/schemas/PageInfo'
+    Problem:
+      $ref: '../common/common.yaml#/components/schemas/Problem'
+
+    CaseStatus:
+      type: string
+      enum: [NEW, OUTREACH, AWAITING_REPLY, NEGOTIATING, PROMISE_ACTIVE, PLAN_ACTIVE, DISPUTED, ESCALATED, RESOLVED, CLOSED]
+    CloseReason:
+      type: string
+      enum: [PAID, CREDITED, WRITTEN_OFF, CANCELLED, UNCOLLECTIBLE]
+    AgentMode:
+      type: string
+      enum: [AUTO, PAUSED, HUMAN_TAKEOVER]
+      description: |
+        AUTO: el agente actúa según el nivel de autonomía. PAUSED: cobranza pausada.
+        HUMAN_TAKEOVER: una persona controla la conversación.
+    AutonomyLevel:
+      type: string
+      enum: [L0, L1, L2, L3]
+    Priority:
+      type: string
+      enum: [LOW, NORMAL, HIGH]
+    PauseReason:
+      type: string
+      enum: [DISPUTE, CUSTOMER_REQUEST, INTERNAL_REVIEW, OTHER]
+    Channel:
+      type: string
+      enum: [WHATSAPP, EMAIL]
+
+    CaseInvoice:
+      type: object
+      additionalProperties: false
+      required: [invoiceId, active, paused]
+      properties:
+        invoiceId:
+          $ref: '#/components/schemas/Uuid'
+        active:
+          type: boolean
+          description: Una factura solo puede estar activa en un caso a la vez.
+        paused:
+          type: boolean
+    Pause:
+      type: object
+      additionalProperties: false
+      required: [reason, pausedAt, invoiceIds]
+      properties:
+        reason:
+          $ref: '#/components/schemas/PauseReason'
+        pausedAt:
+          type: string
+          format: date-time
+        until:
+          type: [string, 'null']
+          format: date-time
+        invoiceIds:
+          type: array
+          description: Facturas pausadas; vacío significa todo el caso.
+          items:
+            $ref: '#/components/schemas/Uuid'
+    NextAction:
+      type: object
+      additionalProperties: false
+      required: [type, at]
+      properties:
+        type:
+          type: string
+          examples: [REQUEST_PAYMENT_DATE]
+        at:
+          type: string
+          format: date-time
+    Case:
+      type: object
+      additionalProperties: false
+      description: Expediente de cobranza de un cliente con N facturas. Sin saldos (los expone ledger-service).
+      required: [id, customerId, status, version, agentMode, autonomyLevel, priority, invoices, openedAt, updatedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          $ref: '#/components/schemas/CaseStatus'
+        closeReason:
+          anyOf:
+            - $ref: '#/components/schemas/CloseReason'
+            - type: 'null'
+        version:
+          type: integer
+          minimum: 1
+          description: Igual al valor del ETag.
+        agentMode:
+          $ref: '#/components/schemas/AgentMode'
+        autonomyLevel:
+          $ref: '#/components/schemas/AutonomyLevel'
+        priority:
+          $ref: '#/components/schemas/Priority'
+        assignedTo:
+          type: [string, 'null']
+          format: uuid
+        pause:
+          anyOf:
+            - $ref: '#/components/schemas/Pause'
+            - type: 'null'
+        nextAction:
+          anyOf:
+            - $ref: '#/components/schemas/NextAction'
+            - type: 'null'
+        invoices:
+          type: array
+          items:
+            $ref: '#/components/schemas/CaseInvoice'
+        openedAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    CasePatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        assignedTo:
+          type: [string, 'null']
+          format: uuid
+        priority:
+          $ref: '#/components/schemas/Priority'
+    NoteRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        note:
+          type: string
+          maxLength: 2000
+    PauseRequest:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      properties:
+        reason:
+          $ref: '#/components/schemas/PauseReason'
+        until:
+          type: string
+          format: date-time
+        invoiceIds:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/Uuid'
+        note:
+          type: string
+          maxLength: 2000
+    EscalateRequest:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          enum: [LEGAL_THREAT, COMPLAINT, HUMAN_REQUEST, POLICY_EXCEPTION, OTHER]
+        note:
+          type: string
+          maxLength: 2000
+    CloseRequest:
+      type: object
+      additionalProperties: false
+      required: [closeReason]
+      properties:
+        closeReason:
+          $ref: '#/components/schemas/CloseReason'
+        note:
+          type: string
+          maxLength: 2000
+
+    TimelineEntry:
+      type: object
+      additionalProperties: false
+      required: [id, occurredAt, type, actor, summary]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        occurredAt:
+          type: string
+          format: date-time
+        type:
+          type: string
+          examples: [CASE_TRANSITIONED]
+        actor:
+          $ref: '#/components/schemas/Actor'
+        summary:
+          type: string
+        refs:
+          type: array
+          description: Entidades relacionadas (mensaje, promesa, pago…) en sus servicios dueños.
+          items:
+            type: object
+            additionalProperties: false
+            required: [type, id]
+            properties:
+              type:
+                type: string
+                examples: [MESSAGE]
+              id:
+                $ref: '#/components/schemas/Uuid'
+    TimelinePage:
+      type: object
+      additionalProperties: false
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/TimelineEntry'
+        page:
+          $ref: '#/components/schemas/PageInfo'
+
+    CaseContext:
+      type: object
+      additionalProperties: false
+      required: [caseId, version, status, agentMode, autonomyLevel, customerId, activeInvoiceIds, pausedInvoiceIds]
+      properties:
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        version:
+          type: integer
+          minimum: 1
+        status:
+          $ref: '#/components/schemas/CaseStatus'
+        agentMode:
+          $ref: '#/components/schemas/AgentMode'
+        autonomyLevel:
+          $ref: '#/components/schemas/AutonomyLevel'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        activeInvoiceIds:
+          type: array
+          items:
+            $ref: '#/components/schemas/Uuid'
+        pausedInvoiceIds:
+          type: array
+          items:
+            $ref: '#/components/schemas/Uuid'
+        nextAction:
+          anyOf:
+            - $ref: '#/components/schemas/NextAction'
+            - type: 'null'
+
+    OutboundPermitRequest:
+      type: object
+      additionalProperties: false
+      required: [expectedVersion, scope, contactId, channel]
+      properties:
+        expectedVersion:
+          type: integer
+          minimum: 1
+        scope:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: string
+            enum: [SEND_MESSAGE, PROPOSE_PROMISE, CONFIRM_PROMISE]
+        contactId:
+          $ref: '#/components/schemas/Uuid'
+        channel:
+          $ref: '#/components/schemas/Channel'
+    OutboundPermit:
+      type: object
+      additionalProperties: false
+      required: [permit, caseVersion, expiresAt]
+      properties:
+        permit:
+          type: string
+          description: JWS compacto firmado por case-service (claves en /internal/v1/permit-keys).
+        caseVersion:
+          type: integer
+          minimum: 1
+        expiresAt:
+          type: string
+          format: date-time
+
+    ActiveCase:
+      type: object
+      additionalProperties: false
+      required: [caseId, status, version]
+      properties:
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          $ref: '#/components/schemas/CaseStatus'
+        version:
+          type: integer
+          minimum: 1
+
+    Jwks:
+      type: object
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items:
+            type: object
+            required: [kty, kid]
+            properties:
+              kty:
+                type: string
+              kid:
+                type: string

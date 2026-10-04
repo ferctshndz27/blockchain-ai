@@ -1,0 +1,46 @@
+# CI de los contratos de Coin: el mismo lint que corre en local (scripts/lint-contracts.sh),
+# en el PR y en cada push a main que toque contracts/. Versiones de los linters fijadas a las
+# instaladas en la máquina de desarrollo (2026-10-03) para que CI y local den el mismo resultado.
+name: contracts
+
+on:
+  pull_request:
+    paths:
+      - "contracts/**"
+      - "scripts/lint-contracts.sh"
+      - ".github/workflows/contracts.yml"
+  push:
+    branches: [main]
+    paths:
+      - "contracts/**"
+      - "scripts/lint-contracts.sh"
+      - ".github/workflows/contracts.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: contracts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint OpenAPI + AsyncAPI
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Instalar linters (versiones fijadas)
+        run: |
+          npm install -g \
+            @stoplight/spectral-cli@6.17.0 \
+            @redocly/cli@2.57.0 \
+            @asyncapi/cli@2.17.0
+
+      - name: Lint de contratos
+        run: scripts/lint-contracts.sh

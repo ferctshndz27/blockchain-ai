@@ -1,0 +1,392 @@
+openapi: 3.1.0
+info:
+  title: agent-service API
+  version: 0.1.0
+  description: |
+    v0 — Turnos del agente, propuestas pendientes de aprobación, registro de
+    prompts y versiones, enrutamiento de modelos, trazas de LLM (PII
+    redactada), costo por tenant, feedback y datasets de evals.
+    Un turno por caso a la vez: lease con `lease_epoch` (fencing) y sweeper de
+    turnos atascados. El LLM gateway es un módulo interno.
+    Publica: agent.events.v1 (AgentTurnCompleted, IntentsDetected,
+    ProposalCreated, ProposalApproved, ProposalRejected, ProposalExpired,
+    ProposalStale).
+    Consume: conversation (MessageReceived), case (CaseNextActionDue,
+    CommandRejected, AgentDecisionApplied), agreement (PromiseRejected,
+    PromiseMissed, PromiseReminderDue), identity (AutonomyLevelChanged).
+    Emite: case.commands.v1 (ApplyAgentDecision, con expectedVersion y expiresAt).
+  contact:
+    name: Equipo Conversación e IA (dueño de agent-service)
+  license:
+    name: Propietario
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: http://agent.receivables.svc.cluster.local
+    description: Dentro del clúster (malla con mTLS)
+tags:
+  - name: AgentTurns
+    description: Turnos del agente (explicabilidad)
+  - name: Proposals
+    description: Propuestas pendientes de aprobación
+  - name: Feedback
+    description: Feedback por turno
+security:
+  - contextToken: []
+paths:
+  /v1/cases/{caseId}/agent-turns:
+    get:
+      operationId: listAgentTurns
+      tags: [AgentTurns]
+      summary: Lista turnos del agente de un caso
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Página de turnos.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentTurnPage'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+  /v1/agent-turns/{turnId}:
+    get:
+      operationId: getAgentTurn
+      tags: [AgentTurns]
+      summary: "Detalle de un turno (explicabilidad: intents, decisión, costo)"
+      parameters:
+        - name: turnId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+      responses:
+        '200':
+          description: Turno.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentTurn'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+  /v1/agent-turns/{turnId}/feedback:
+    post:
+      operationId: submitTurnFeedback
+      tags: [Feedback]
+      summary: Registra feedback humano sobre un turno
+      parameters:
+        - name: turnId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TurnFeedbackCreate'
+      responses:
+        '201':
+          description: Feedback registrado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TurnFeedback'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+  /v1/proposals/{proposalId}:
+    get:
+      operationId: getProposal
+      tags: [Proposals]
+      summary: Detalle de una propuesta del agente
+      parameters:
+        - name: proposalId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+      responses:
+        '200':
+          description: Propuesta.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Proposal'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+  /v1/proposals/{proposalId}/approve:
+    post:
+      operationId: approveProposal
+      tags: [Proposals]
+      summary: "Aprueba una propuesta (If-Match; revalida antes de aplicar)"
+      parameters:
+        - name: proposalId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Propuesta aprobada y aplicada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Proposal'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/PreconditionFailed'
+
+  /v1/proposals/{proposalId}/reject:
+    post:
+      operationId: rejectProposal
+      tags: [Proposals]
+      summary: "Rechaza una propuesta (If-Match)"
+      parameters:
+        - name: proposalId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                reason:
+                  type: string
+                  maxLength: 500
+      responses:
+        '200':
+          description: Propuesta rechazada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Proposal'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/PreconditionFailed'
+
+  /v1/proposals/{proposalId}/edit-and-approve:
+    post:
+      operationId: editAndApproveProposal
+      tags: [Proposals]
+      summary: "Edita y aprueba una propuesta (If-Match; revalida)"
+      parameters:
+        - name: proposalId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProposalEdit'
+      responses:
+        '200':
+          description: Propuesta editada y aprobada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Proposal'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/PreconditionFailed'
+
+components:
+  securitySchemes:
+    contextToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/contextToken'
+  parameters:
+    CaseId:
+      name: caseId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    IdempotencyKey:
+      $ref: '../common/common.yaml#/components/parameters/IdempotencyKey'
+    IfMatch:
+      $ref: '../common/common.yaml#/components/parameters/IfMatch'
+    Cursor:
+      $ref: '../common/common.yaml#/components/parameters/Cursor'
+    Limit:
+      $ref: '../common/common.yaml#/components/parameters/Limit'
+  schemas:
+    Uuid:
+      $ref: '../common/common.yaml#/components/schemas/Uuid'
+    PageInfo:
+      $ref: '../common/common.yaml#/components/schemas/PageInfo'
+    TurnStatus:
+      type: string
+      enum: [STARTED, LLM_DONE, POLICY_DONE, DECISION_SENT, APPLIED, REJECTED, EXPIRED, AWAITING_APPROVAL]
+    ProposalStatus:
+      type: string
+      enum: [PENDING, APPROVED, REJECTED, EXPIRED, STALE]
+    AgentTurn:
+      type: object
+      additionalProperties: false
+      required: [turnId, caseId, status, leaseEpoch, startedAt]
+      properties:
+        turnId:
+          $ref: '#/components/schemas/Uuid'
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          $ref: '#/components/schemas/TurnStatus'
+        leaseEpoch:
+          type: integer
+          minimum: 0
+        intent:
+          type: string
+          maxLength: 256
+        decisionSummary:
+          type: string
+          maxLength: 2000
+        modelVersion:
+          type: string
+          maxLength: 128
+        promptVersion:
+          type: string
+          maxLength: 128
+        costUsd:
+          type: number
+          format: float
+          minimum: 0
+        llmTraceId:
+          $ref: '#/components/schemas/Uuid'
+        proposalId:
+          $ref: '#/components/schemas/Uuid'
+        startedAt:
+          type: string
+          format: date-time
+        finishedAt:
+          type: string
+          format: date-time
+    AgentTurnPage:
+      type: object
+      additionalProperties: false
+      required: [items, pageInfo]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AgentTurn'
+        pageInfo:
+          $ref: '#/components/schemas/PageInfo'
+    Proposal:
+      type: object
+      additionalProperties: false
+      required: [proposalId, caseId, turnId, kind, status, version]
+      properties:
+        proposalId:
+          $ref: '#/components/schemas/Uuid'
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        turnId:
+          $ref: '#/components/schemas/Uuid'
+        kind:
+          type: string
+          enum: [SEND_MESSAGE, PROPOSE_PROMISE, SEND_OFFER, ESCALATE, PAUSE]
+        payload:
+          type: object
+          additionalProperties: true
+        status:
+          $ref: '#/components/schemas/ProposalStatus'
+        expiresAt:
+          type: string
+          format: date-time
+        version:
+          type: integer
+          minimum: 1
+        approvedBy:
+          $ref: '../common/common.yaml#/components/schemas/Actor'
+        createdAt:
+          type: string
+          format: date-time
+        decidedAt:
+          type: string
+          format: date-time
+    ProposalEdit:
+      type: object
+      additionalProperties: false
+      required: [payload]
+      properties:
+        payload:
+          type: object
+          additionalProperties: true
+        note:
+          type: string
+          maxLength: 500
+    TurnFeedbackCreate:
+      type: object
+      additionalProperties: false
+      required: [rating]
+      properties:
+        rating:
+          type: integer
+          minimum: 1
+          maximum: 5
+        comment:
+          type: string
+          maxLength: 1000
+    TurnFeedback:
+      type: object
+      additionalProperties: false
+      required: [feedbackId, turnId, rating, createdAt]
+      properties:
+        feedbackId:
+          $ref: '#/components/schemas/Uuid'
+        turnId:
+          $ref: '#/components/schemas/Uuid'
+        rating:
+          type: integer
+          minimum: 1
+          maximum: 5
+        comment:
+          type: string
+          maxLength: 1000
+        author:
+          $ref: '../common/common.yaml#/components/schemas/Actor'
+        createdAt:
+          type: string
+          format: date-time

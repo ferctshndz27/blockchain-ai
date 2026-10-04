@@ -1,0 +1,186 @@
+openapi: 3.1.0
+info:
+  title: webhook-ingress API
+  version: 0.1.0
+  description: |
+    v0 — Recibe webhooks, verifica la firma sobre el cuerpo crudo, guarda el
+    payload cifrado y publica el evento crudo. Sin lógica de negocio.
+    `UNIQUE (provider, provider_event_id)` da idempotencia: reenvíos del
+    proveedor no duplican.
+    SLO: 99.95 % de disponibilidad; p99 < 500 ms. No resuelve el tenant
+    (lo hace el consumidor dueño).
+    Publica: ingress.whatsapp.v1, ingress.email.v1, ingress.psp.v1,
+    ingress.bank.v1, ingress.idp.v1 (payload del proveedor, retención 3 días).
+  contact:
+    name: Plataforma (dueño de webhook-ingress)
+  license:
+    name: Propietario
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: https://ingress.coingestion.com
+    description: Origen público (ingreso de webhooks de proveedores)
+security: []
+tags:
+  - name: Ingress
+    description: Verificación y recepción de webhooks
+paths:
+  /hooks/whatsapp:
+    get:
+      operationId: verifyWhatsapp
+      tags: [Ingress]
+      summary: Verificación de suscripción de Meta (handshake)
+      description: |
+        Meta llama con `hub.mode`, `hub.verify_token` y `hub.challenge`.
+        Si el token coincide, responde 200 con el challenge en el cuerpo.
+      parameters:
+        - name: hub.mode
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: hub.verify_token
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: hub.challenge
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Challenge (si el token coincide).
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      operationId: receiveWhatsapp
+      tags: [Ingress]
+      summary: Recibe un webhook de WhatsApp (Meta Cloud API)
+      description: |
+        Verifica la firma (`X-Hub-Signature-256`) sobre el cuerpo crudo,
+        guarda el payload cifrado (`UNIQUE (provider, provider_event_id)`)
+        y publica `ingress.whatsapp.v1`. Responde 200 rápido; el procesamiento
+        lo hace el consumidor dueño.
+      parameters:
+        - name: X-Hub-Signature-256
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Aceptado y publicado.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /hooks/email/{provider}:
+    post:
+      operationId: receiveEmail
+      tags: [Ingress]
+      summary: Recibe un webhook de email (proveedor genérico)
+      description: |
+        Verifica la firma del proveedor sobre el cuerpo crudo, guarda el
+        payload cifrado y publica `ingress.email.v1`.
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema:
+            type: string
+            examples: [gmail, outlook, custom]
+      responses:
+        '200':
+          description: Aceptado y publicado.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /hooks/psp/{provider}:
+    post:
+      operationId: receivePsp
+      tags: [Ingress]
+      summary: Recibe un webhook de PSP (cobros)
+      description: |
+        Verifica la firma del PSP sobre el cuerpo crudo, guarda el payload
+        cifrado y publica `ingress.psp.v1`.
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema:
+            type: string
+            examples: [stripe, mercadopago, custom]
+      responses:
+        '200':
+          description: Aceptado y publicado.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /hooks/bank/{provider}:
+    post:
+      operationId: receiveBank
+      tags: [Ingress]
+      summary: Recibe un webhook bancario (aviso de abono)
+      description: |
+        Verifica la firma sobre el cuerpo crudo, guarda el payload cifrado y
+        publica `ingress.bank.v1`.
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Aceptado y publicado.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /hooks/idp:
+    post:
+      operationId: receiveIdp
+      tags: [Ingress]
+      summary: Recibe un webhook del IdP (SSO / eventos de identidad)
+      description: |
+        Verifica la firma, guarda el payload cifrado y publica `ingress.idp.v1`.
+      responses:
+        '200':
+          description: Aceptado y publicado.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+components:
+  responses:
+    BadRequest:
+      description: Payload malformado o firma no verificable.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: Firma inválida o token de verificación incorrecto.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Ruta o proveedor desconocido.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    Problem:
+      $ref: '../common/common.yaml#/components/schemas/Problem'

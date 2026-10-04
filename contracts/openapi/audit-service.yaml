@@ -1,0 +1,231 @@
+openapi: 3.1.0
+info:
+  title: audit-service API
+  version: 0.1.0
+  description: |
+    v0 — Bitácora consolidada append-only con cadena de hashes por tenant
+    (sellado periódico) y expediente verificable.
+    Consume: *.events.v1 (todos).
+    Regla: las acciones críticas (aprobaciones, cambios de política o
+    autonomía, conciliación manual) también se registran en la BD del servicio
+    dueño en la misma transacción; audit-service consolida y sella.
+    F3: sellado NOM-151 y anclaje Merkle (POST /v1/evidence-verifications).
+  contact:
+    name: Equipo Conversación e IA (dueño de audit-service)
+  license:
+    name: Propietario
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: http://audit.receivables.svc.cluster.local
+    description: Dentro del clúster (malla con mTLS)
+tags:
+  - name: Audit
+    description: Bitácora consolidada y verificación
+security:
+  - contextToken: []
+paths:
+  /v1/audit-events:
+    get:
+      operationId: listAuditEvents
+      tags: [Audit]
+      summary: Lista eventos de auditoría (append-only)
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: entityType
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 64
+        - name: entityId
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: Página de eventos de auditoría.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditEventPage'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+
+  /v1/cases/{caseId}/evidence-record:
+    get:
+      operationId: getCaseEvidenceRecord
+      tags: [Audit]
+      summary: Expediente verificable de un caso (F2)
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+      responses:
+        '200':
+          description: Expediente de evidencia del caso.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseEvidenceRecord'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+  /v1/evidence-verifications:
+    post:
+      operationId: verifyEvidence
+      tags: [Audit]
+      summary: Verifica la cadena de hashes de un expediente (F3, público)
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [caseId]
+              properties:
+                caseId:
+                  $ref: '#/components/schemas/Uuid'
+      responses:
+        '200':
+          description: Resultado de la verificación de integridad.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvidenceVerification'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    contextToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/contextToken'
+  parameters:
+    CaseId:
+      name: caseId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    IdempotencyKey:
+      $ref: '../common/common.yaml#/components/parameters/IdempotencyKey'
+    Cursor:
+      $ref: '../common/common.yaml#/components/parameters/Cursor'
+    Limit:
+      $ref: '../common/common.yaml#/components/parameters/Limit'
+  schemas:
+    Uuid:
+      $ref: '../common/common.yaml#/components/schemas/Uuid'
+    PageInfo:
+      $ref: '../common/common.yaml#/components/schemas/PageInfo'
+    Actor:
+      $ref: '../common/common.yaml#/components/schemas/Actor'
+    AuditEvent:
+      type: object
+      additionalProperties: false
+      required: [auditEventId, entityType, entityId, eventTime, previousHash, hash]
+      properties:
+        auditEventId:
+          $ref: '#/components/schemas/Uuid'
+        sourceService:
+          type: string
+          maxLength: 64
+        eventType:
+          type: string
+          maxLength: 128
+        entityType:
+          type: string
+          maxLength: 64
+        entityId:
+          $ref: '#/components/schemas/Uuid'
+        actor:
+          $ref: '#/components/schemas/Actor'
+        correlationId:
+          $ref: '#/components/schemas/Uuid'
+        data:
+          type: object
+          additionalProperties: true
+        eventTime:
+          type: string
+          format: date-time
+        previousHash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        hash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        sealedAt:
+          type: [string, 'null']
+          format: date-time
+    AuditEventPage:
+      type: object
+      additionalProperties: false
+      required: [items, pageInfo]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditEvent'
+        pageInfo:
+          $ref: '#/components/schemas/PageInfo'
+    CaseEvidenceRecord:
+      type: object
+      additionalProperties: false
+      required: [caseId, eventCount, headHash, sealed]
+      properties:
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        eventCount:
+          type: integer
+          minimum: 0
+        headHash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        sealed:
+          type: boolean
+        merkleRoot:
+          type: [string, 'null']
+          pattern: '^[a-f0-9]{64}$'
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditEvent'
+    EvidenceVerification:
+      type: object
+      additionalProperties: false
+      required: [caseId, valid, eventCount]
+      properties:
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        valid:
+          type: boolean
+        eventCount:
+          type: integer
+          minimum: 0
+        headHash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        breakAt:
+          type: [integer, 'null']
+          minimum: 0
+        checkedAt:
+          type: string
+          format: date-time

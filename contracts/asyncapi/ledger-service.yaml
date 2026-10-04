@@ -1,0 +1,581 @@
+asyncapi: 3.1.0
+info:
+  title: ledger-service — eventos
+  version: 0.1.0
+  description: |
+    v0 — Hechos del libro auxiliar (ledger) que publica ledger-service, dueño de los SALDOS
+    (autoridad única), de las asignaciones (diario append-only) y del motor de conciliación.
+
+    - Envoltura CloudEvents 1.0 en modo binario (cabeceras `ce_*`).
+    - Key de Kafka = id del agregado por evento (invoiceId, paymentId, allocationId, customerId):
+      orden garantizado por agregado dentro de cada topic.
+    - Publicación con outbox transaccional; consumo idempotente con inbox (`ce_id`).
+    - invoice-service es dueño del DOCUMENTO; ledger-service es dueño del SALDO. Invariantes en
+      una sola BD (Σ asignaciones ≤ monto del pago · Σ asignaciones + créditos ≤ total de la
+      factura), por eso ledger guarda proyecciones de facturas y pagos.
+    - ledger.events.v1 tiene retención infinita (tiered storage en S3) y sin datos personales
+      (v4 §6.2).
+    - Los consumidores comparan versiones y, ante un hueco, se re-sincronizan con
+      `GET /v1/ledger/invoices/{invoiceId}` (contracts/openapi/ledger-service.yaml).
+defaultContentType: application/json
+
+servers:
+  production:
+    host: kafka.receivables.internal:9098
+    protocol: kafka-secure
+    description: Kafka gestionado con TLS y autenticación IAM/SASL; ACL por servicio.
+
+channels:
+  ledgerEvents:
+    address: ledger.events.v1
+    description: Hechos del ledger. Productor único — ledger-service. Retención infinita (tiered storage en S3).
+    messages:
+      PaymentAllocated:
+        $ref: '#/components/messages/PaymentAllocated'
+      AllocationReversed:
+        $ref: '#/components/messages/AllocationReversed'
+      InvoiceBalanceChanged:
+        $ref: '#/components/messages/InvoiceBalanceChanged'
+      InvoiceSettled:
+        $ref: '#/components/messages/InvoiceSettled'
+      PaymentUnmatched:
+        $ref: '#/components/messages/PaymentUnmatched'
+      CustomerCreditBalanceChanged:
+        $ref: '#/components/messages/CustomerCreditBalanceChanged'
+    bindings:
+      kafka:
+        partitions: 12
+        replicas: 3
+        bindingVersion: '0.5.0'
+
+  invoiceEvents:
+    address: invoice.events.v1
+    description: Propiedad de invoice-service. ledger-service consume InvoiceIssued, InvoiceUpdated, InvoiceCancelled y CreditNoteIssued para su proyección de facturas.
+    messages:
+      InvoiceIssued:
+        $ref: '#/components/messages/InvoiceIssued'
+      InvoiceUpdated:
+        $ref: '#/components/messages/InvoiceUpdated'
+      InvoiceCancelled:
+        $ref: '#/components/messages/InvoiceCancelled'
+      CreditNoteIssued:
+        $ref: '#/components/messages/CreditNoteIssued'
+
+  paymentEvents:
+    address: payment.events.v1
+    description: Propiedad de payment-service. ledger-service consume PaymentConfirmed y PaymentReversed.
+    messages:
+      PaymentConfirmed:
+        $ref: '#/components/messages/PaymentConfirmed'
+      PaymentReversed:
+        $ref: '#/components/messages/PaymentReversed'
+
+operations:
+  publishLedgerEvents:
+    action: send
+    channel:
+      $ref: '#/channels/ledgerEvents'
+    summary: ledger-service publica los hechos del libro auxiliar mediante su outbox.
+
+  receiveInvoiceEvents:
+    action: receive
+    channel:
+      $ref: '#/channels/invoiceEvents'
+    summary: |
+      Mantiene la proyección de facturas (total, moneda, estado) que sustenta los invariantes
+      del ledger. InvoiceIssued reintenta el matching de pagos pendientes que llegaron antes
+      que su factura. InvoiceCancelled y CreditNoteIssued ajustan el saldo proyectado.
+    bindings:
+      kafka:
+        groupId:
+          type: string
+          enum: [ledger-service]
+        bindingVersion: '0.5.0'
+
+  receivePaymentEvents:
+    action: receive
+    channel:
+      $ref: '#/channels/paymentEvents'
+    summary: |
+      PaymentConfirmed dispara el matching determinista (CLABE virtual / referencia) con
+      bloqueo del pago y de las facturas en orden de id, y publica PaymentAllocated +
+      InvoiceBalanceChanged, o PaymentUnmatched si no hay match (task-service concilia a
+      mano). PaymentReversed registra un movimiento REVERSAL (fila nueva, nunca UPDATE) y
+      repubblica InvoiceBalanceChanged.
+    bindings:
+      kafka:
+        groupId:
+          type: string
+          enum: [ledger-service]
+        bindingVersion: '0.5.0'
+
+components:
+  messageBindings:
+    byInvoiceId:
+      kafka:
+        key:
+          type: string
+          format: uuid
+          description: invoiceId
+        bindingVersion: '0.5.0'
+    byPaymentId:
+      kafka:
+        key:
+          type: string
+          format: uuid
+          description: paymentId
+        bindingVersion: '0.5.0'
+    byAllocationId:
+      kafka:
+        key:
+          type: string
+          format: uuid
+          description: allocationId
+        bindingVersion: '0.5.0'
+    byCustomerId:
+      kafka:
+        key:
+          type: string
+          format: uuid
+          description: customerId
+        bindingVersion: '0.5.0'
+
+  messages:
+    PaymentAllocated:
+      name: PaymentAllocated
+      title: Pago asignado a factura(s)
+      x-ce-type: com.receivables.ledger.payment-allocated.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/PaymentAllocatedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byPaymentId'
+    AllocationReversed:
+      name: AllocationReversed
+      title: Asignación revertida
+      x-ce-type: com.receivables.ledger.allocation-reversed.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/AllocationReversedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byAllocationId'
+    InvoiceBalanceChanged:
+      name: InvoiceBalanceChanged
+      title: Saldo de la factura cambiado — autoridad de ledger-service
+      x-ce-type: com.receivables.ledger.invoice-balance-changed.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/InvoiceBalanceChangedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byInvoiceId'
+    InvoiceSettled:
+      name: InvoiceSettled
+      title: Factura saldada
+      x-ce-type: com.receivables.ledger.invoice-settled.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/InvoiceSettledPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byInvoiceId'
+    PaymentUnmatched:
+      name: PaymentUnmatched
+      title: Pago sin casar
+      x-ce-type: com.receivables.ledger.payment-unmatched.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/PaymentUnmatchedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byPaymentId'
+    CustomerCreditBalanceChanged:
+      name: CustomerCreditBalanceChanged
+      title: Saldó la cuenta de crédito del cliente
+      x-ce-type: com.receivables.ledger.customer-credit-balance-changed.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/CustomerCreditBalanceChangedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byCustomerId'
+
+    InvoiceIssued:
+      name: InvoiceIssued
+      title: Factura emitida (propiedad de invoice-service)
+      x-ce-type: com.receivables.invoice.issued.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/InvoiceIssuedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byInvoiceId'
+    InvoiceUpdated:
+      name: InvoiceUpdated
+      title: Factura actualizada (propiedad de invoice-service)
+      x-ce-type: com.receivables.invoice.updated.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/InvoiceUpdatedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byInvoiceId'
+    InvoiceCancelled:
+      name: InvoiceCancelled
+      title: Factura cancelada (propiedad de invoice-service)
+      x-ce-type: com.receivables.invoice.cancelled.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/InvoiceCancelledPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byInvoiceId'
+    CreditNoteIssued:
+      name: CreditNoteIssued
+      title: Nota de crédito emitida (propiedad de invoice-service)
+      x-ce-type: com.receivables.invoice.credit-note-issued.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/CreditNoteIssuedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byInvoiceId'
+
+    PaymentConfirmed:
+      name: PaymentConfirmed
+      title: Pago confirmado (propiedad de payment-service)
+      x-ce-type: com.receivables.payment.confirmed.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/PaymentConfirmedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byPaymentId'
+    PaymentReversed:
+      name: PaymentReversed
+      title: Pago revertido (propiedad de payment-service)
+      x-ce-type: com.receivables.payment.reversed.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/PaymentReversedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byPaymentId'
+
+  schemas:
+    EventHeaders:
+      type: object
+      required: [ce_specversion, ce_id, ce_source, ce_type, ce_time, ce_tenantid, ce_correlationid]
+      properties:
+        ce_specversion:
+          type: string
+          const: '1.0'
+        ce_id:
+          type: string
+          format: uuid
+          description: Id único del mensaje (UUID v7); clave del inbox del consumidor.
+        ce_source:
+          type: string
+          examples: [/ledger-service]
+        ce_type:
+          type: string
+          examples: [com.receivables.ledger.payment-allocated.v1]
+        ce_time:
+          type: string
+          format: date-time
+        ce_subject:
+          type: string
+          examples: [payment/0192f5d2-7c1a-7b3e-9f10-2a6c1d4e8b90]
+        ce_tenantid:
+          type: string
+          format: uuid
+        ce_correlationid:
+          type: string
+          description: Agrupa todos los mensajes de un mismo flujo (p. ej. un pago y sus asignaciones).
+        ce_causationid:
+          type: string
+          description: ce_id del mensaje que causó este.
+        traceparent:
+          type: string
+          description: Contexto W3C Trace Context.
+        content-type:
+          type: string
+          const: application/json
+
+    Uuid:
+      type: string
+      format: uuid
+    Money:
+      type: object
+      additionalProperties: false
+      required: [amount, currency]
+      properties:
+        amount:
+          type: string
+          pattern: '^-?\d{1,15}(\.\d{1,4})?$'
+          description: Decimal exacto como cadena.
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+    SettlementStatus:
+      type: string
+      enum: [SETTLED, PARTIALLY_SETTLED, UNSETTLED]
+      description: Coincide letra por letra con el enum del schema Invoice de contracts/openapi/invoice-service.yaml.
+    AllocationKind:
+      type: string
+      enum: [AUTO, MANUAL]
+      description: Coincide letra por letra con el enum kind del schema Allocation de contracts/openapi/ledger-service.yaml.
+    PaymentSource:
+      type: string
+      enum: [PSP, BANK, VIRTUAL_ACCOUNT]
+      description: Coincide letra por letra con el enum source del schema Payment de contracts/openapi/payment-service.yaml.
+    UnmatchedReason:
+      type: string
+      enum: [NO_CANDIDATE, AMOUNT_MISMATCH, CURRENCY_MISMATCH, INVOICE_CANCELLED]
+
+    PaymentAllocatedPayload:
+      type: object
+      additionalProperties: false
+      required: [paymentId, allocationId, invoiceId, amount, kind, allocatedAt]
+      properties:
+        paymentId:
+          $ref: '#/components/schemas/Uuid'
+        allocationId:
+          $ref: '#/components/schemas/Uuid'
+        invoiceId:
+          $ref: '#/components/schemas/Uuid'
+        amount:
+          $ref: '#/components/schemas/Money'
+        kind:
+          $ref: '#/components/schemas/AllocationKind'
+        allocatedAt:
+          type: string
+          format: date-time
+    AllocationReversedPayload:
+      type: object
+      additionalProperties: false
+      required: [allocationId, reversalId, paymentId, invoiceId, amount, reason, reversedAt]
+      properties:
+        allocationId:
+          $ref: '#/components/schemas/Uuid'
+        reversalId:
+          $ref: '#/components/schemas/Uuid'
+        paymentId:
+          $ref: '#/components/schemas/Uuid'
+        invoiceId:
+          $ref: '#/components/schemas/Uuid'
+        amount:
+          $ref: '#/components/schemas/Money'
+        reason:
+          type: string
+          maxLength: 500
+        reversedAt:
+          type: string
+          format: date-time
+    InvoiceBalanceChangedPayload:
+      type: object
+      additionalProperties: false
+      description: Autoridad de ledger-service (Σ asignaciones + créditos ≤ total de la factura).
+      required: [invoiceId, customerId, balanceDue, paid, credits, settlementStatus, changedAt]
+      properties:
+        invoiceId:
+          $ref: '#/components/schemas/Uuid'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        balanceDue:
+          $ref: '#/components/schemas/Money'
+        paid:
+          $ref: '#/components/schemas/Money'
+        credits:
+          $ref: '#/components/schemas/Money'
+        settlementStatus:
+          $ref: '#/components/schemas/SettlementStatus'
+        changedAt:
+          type: string
+          format: date-time
+    InvoiceSettledPayload:
+      type: object
+      additionalProperties: false
+      required: [invoiceId, customerId, totalPaid, settledAt]
+      properties:
+        invoiceId:
+          $ref: '#/components/schemas/Uuid'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        totalPaid:
+          $ref: '#/components/schemas/Money'
+        settledAt:
+          type: string
+          format: date-time
+    PaymentUnmatchedPayload:
+      type: object
+      additionalProperties: false
+      required: [paymentId, amount, reason, unmatchedAt]
+      properties:
+        paymentId:
+          $ref: '#/components/schemas/Uuid'
+        amount:
+          $ref: '#/components/schemas/Money'
+        reason:
+          $ref: '#/components/schemas/UnmatchedReason'
+        unmatchedAt:
+          type: string
+          format: date-time
+    CustomerCreditBalanceChangedPayload:
+      type: object
+      additionalProperties: false
+      required: [customerId, creditBalance, changedAt]
+      properties:
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        creditBalance:
+          $ref: '#/components/schemas/Money'
+        changedAt:
+          type: string
+          format: date-time
+
+    InvoiceIssuedPayload:
+      type: object
+      additionalProperties: false
+      required: [invoiceId, version, customerId, total, issueDate, dueDate, actor]
+      properties:
+        invoiceId:
+          $ref: '#/components/schemas/Uuid'
+        version:
+          type: integer
+          minimum: 1
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        folio:
+          type: string
+          maxLength: 64
+        uuidCfdi:
+          type: string
+          description: UUID del CFDI 4.0 (si aplica).
+        total:
+          $ref: '#/components/schemas/Money'
+        issueDate:
+          type: string
+          format: date
+        dueDate:
+          type: string
+          format: date
+        actor:
+          $ref: '#/components/schemas/Actor'
+    InvoiceUpdatedPayload:
+      type: object
+      additionalProperties: false
+      required: [invoiceId, version, changedFields, actor]
+      properties:
+        invoiceId:
+          $ref: '#/components/schemas/Uuid'
+        version:
+          type: integer
+          minimum: 1
+        changedFields:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            enum: [folio, dueDate]
+        actor:
+          $ref: '#/components/schemas/Actor'
+    InvoiceCancelledPayload:
+      type: object
+      additionalProperties: false
+      required: [invoiceId, version, reason, actor]
+      properties:
+        invoiceId:
+          $ref: '#/components/schemas/Uuid'
+        version:
+          type: integer
+          minimum: 1
+        reason:
+          type: string
+          enum: [DUPLICATE, ERRONEOUS, NOT_DELIVERED, CUSTOMER_REQUEST, OTHER]
+        actor:
+          $ref: '#/components/schemas/Actor'
+    CreditNoteIssuedPayload:
+      type: object
+      additionalProperties: false
+      required: [invoiceId, creditNoteId, creditNoteVersion, customerId, amount, reason, issuedAt, actor]
+      properties:
+        invoiceId:
+          $ref: '#/components/schemas/Uuid'
+        creditNoteId:
+          $ref: '#/components/schemas/Uuid'
+        creditNoteVersion:
+          type: integer
+          minimum: 1
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        folio:
+          type: string
+          maxLength: 64
+        amount:
+          $ref: '#/components/schemas/Money'
+        reason:
+          type: string
+          enum: [DUPLICATE, ERRONEOUS_AMOUNT, RETURNED, SERVICE_NOT_DELIVERED, AGREEMENT, OTHER]
+        issuedAt:
+          type: string
+          format: date-time
+        actor:
+          $ref: '#/components/schemas/Actor'
+
+    PaymentConfirmedPayload:
+      type: object
+      additionalProperties: false
+      required: [paymentId, customerId, source, amount, confirmedAt]
+      properties:
+        paymentId:
+          $ref: '#/components/schemas/Uuid'
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        source:
+          $ref: '#/components/schemas/PaymentSource'
+        providerRef:
+          type: string
+          description: Referencia del proveedor (id PSP / referencia bancaria).
+        amount:
+          $ref: '#/components/schemas/Money'
+        receivedAt:
+          type: string
+          format: date-time
+        confirmedAt:
+          type: string
+          format: date-time
+    PaymentReversedPayload:
+      type: object
+      additionalProperties: false
+      required: [paymentId, customerId, amount, reason, reversedAt]
+      properties:
+        paymentId:
+          $ref: '#/components/schemas/Uuid'
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        amount:
+          $ref: '#/components/schemas/Money'
+        reason:
+          type: string
+          enum: [CUSTOMER_REQUEST, PSP_DISPUTE, BANK_RECALL, OTHER]
+        reversedAt:
+          type: string
+          format: date-time
+
+    Actor:
+      type: object
+      additionalProperties: false
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [HUMAN, AI, SYSTEM]
+        id:
+          type: string

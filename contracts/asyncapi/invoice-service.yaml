@@ -1,0 +1,491 @@
+asyncapi: 3.1.0
+info:
+  title: invoice-service — eventos
+  version: 0.1.0
+  description: |
+    v0 — Hechos del documento Invoice que publica invoice-service, los eventos de saldo
+    que consume de ledger-service para proyectar `settlementStatus` (solo lectura) y el
+    evento de configuración de identity-service (zona horaria del tenant para su tick diario).
+
+    - Envoltura CloudEvents 1.0 en modo binario (cabeceras `ce_*`).
+    - Key de Kafka = invoiceId (importId en InvoiceImportCompleted): orden garantizado por
+      factura dentro de cada topic.
+    - Publicación con outbox transaccional; consumo idempotente con inbox (`ce_id`).
+    - invoice-service es dueño del DOCUMENTO; ledger-service es dueño del SALDO. El saldo
+      (balanceDue/paid/credits) y `settlementStatus` solo llegan por InvoiceBalanceChanged;
+      ante un hueco, el consumidor se re-sincroniza con `GET /v1/invoices/{invoiceId}`
+      (contracts/openapi/invoice-service.yaml) o `GET /v1/ledger/invoices/{invoiceId}`.
+defaultContentType: application/json
+
+servers:
+  production:
+    host: kafka.receivables.internal:9098
+    protocol: kafka-secure
+    description: Kafka gestionado con TLS y autenticación IAM/SASL; ACL por servicio.
+
+channels:
+  invoiceEvents:
+    address: invoice.events.v1
+    description: Hechos del documento Invoice. Productor único — invoice-service.
+    messages:
+      InvoiceIssued:
+        $ref: '#/components/messages/InvoiceIssued'
+      InvoiceUpdated:
+        $ref: '#/components/messages/InvoiceUpdated'
+      InvoiceCancelled:
+        $ref: '#/components/messages/InvoiceCancelled'
+      CreditNoteIssued:
+        $ref: '#/components/messages/CreditNoteIssued'
+      InvoiceBecameOverdue:
+        $ref: '#/components/messages/InvoiceBecameOverdue'
+      InvoiceDueSoon:
+        $ref: '#/components/messages/InvoiceDueSoon'
+      InvoiceAgingBucketChanged:
+        $ref: '#/components/messages/InvoiceAgingBucketChanged'
+      InvoiceImportCompleted:
+        $ref: '#/components/messages/InvoiceImportCompleted'
+    bindings:
+      kafka:
+        partitions: 12
+        replicas: 3
+        bindingVersion: '0.5.0'
+
+  ledgerEvents:
+    address: ledger.events.v1
+    description: Propiedad de ledger-service. invoice-service consume solo InvoiceBalanceChanged.
+    messages:
+      InvoiceBalanceChanged:
+        $ref: '#/components/messages/InvoiceBalanceChanged'
+
+  identityEvents:
+    address: identity.events.v1
+    description: Propiedad de identity-service. invoice-service consume solo OrganizationSettingsChanged (zona horaria del tenant para su tick diario).
+    messages:
+      OrganizationSettingsChanged:
+        $ref: '#/components/messages/OrganizationSettingsChanged'
+
+operations:
+  publishInvoiceEvents:
+    action: send
+    channel:
+      $ref: '#/channels/invoiceEvents'
+    summary: invoice-service publica los hechos del documento mediante su outbox.
+
+  receiveLedgerBalanceEvents:
+    action: receive
+    channel:
+      $ref: '#/channels/ledgerEvents'
+    summary: |
+      Aplica InvoiceBalanceChanged como proyección de solo lectura de `settlementStatus`
+      (SETTLED / PARTIALLY_SETTLED / UNSETTLED) y de los saldos mostrados. No modifica el
+      documento; ante un hueco de versiones, se re-sincroniza con la API REST del dueño.
+    bindings:
+      kafka:
+        groupId:
+          type: string
+          enum: [invoice-service]
+        bindingVersion: '0.5.0'
+
+  receiveIdentitySettingsEvents:
+    action: receive
+    channel:
+      $ref: '#/channels/identityEvents'
+    summary: |
+      Aplica OrganizationSettingsChanged para actualizar la zona horaria del tenant que
+      gobierna su tick diario de vencimientos y antigüedad. No modifica el documento.
+    bindings:
+      kafka:
+        groupId:
+          type: string
+          enum: [invoice-service]
+        bindingVersion: '0.5.0'
+
+components:
+  messageBindings:
+    byInvoiceId:
+      kafka:
+        key:
+          type: string
+          format: uuid
+          description: invoiceId
+        bindingVersion: '0.5.0'
+    byImportId:
+      kafka:
+        key:
+          type: string
+          format: uuid
+          description: importId
+        bindingVersion: '0.5.0'
+
+  messages:
+    InvoiceIssued:
+      name: InvoiceIssued
+      title: Factura emitida
+      x-ce-type: com.receivables.invoice.issued.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/InvoiceIssuedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byInvoiceId'
+    InvoiceUpdated:
+      name: InvoiceUpdated
+      title: Factura actualizada
+      x-ce-type: com.receivables.invoice.updated.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/InvoiceUpdatedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byInvoiceId'
+    InvoiceCancelled:
+      name: InvoiceCancelled
+      title: Factura cancelada
+      x-ce-type: com.receivables.invoice.cancelled.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/InvoiceCancelledPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byInvoiceId'
+    CreditNoteIssued:
+      name: CreditNoteIssued
+      title: Nota de crédito emitida
+      x-ce-type: com.receivables.invoice.credit-note-issued.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/CreditNoteIssuedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byInvoiceId'
+    InvoiceBecameOverdue:
+      name: InvoiceBecameOverdue
+      title: Factura vencida (tick diario por tenant, en su zona horaria)
+      x-ce-type: com.receivables.invoice.became-overdue.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/InvoiceBecameOverduePayload'
+      bindings:
+        $ref: '#/components/messageBindings/byInvoiceId'
+    InvoiceDueSoon:
+      name: InvoiceDueSoon
+      title: Factura por vencer
+      x-ce-type: com.receivables.invoice.due-soon.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/InvoiceDueSoonPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byInvoiceId'
+    InvoiceAgingBucketChanged:
+      name: InvoiceAgingBucketChanged
+      title: Cambio de bucket de antigüedad
+      x-ce-type: com.receivables.invoice.aging-bucket-changed.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/InvoiceAgingBucketChangedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byInvoiceId'
+    InvoiceImportCompleted:
+      name: InvoiceImportCompleted
+      title: Importación terminada
+      x-ce-type: com.receivables.invoice.import-completed.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/InvoiceImportCompletedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byImportId'
+    OrganizationSettingsChanged:
+      name: OrganizationSettingsChanged
+      title: Cambió la configuración del tenant (aquí, la zona horaria)
+      x-ce-type: com.receivables.identity.organization-settings-changed.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/OrganizationSettingsChangedPayload'
+    InvoiceBalanceChanged:
+      name: InvoiceBalanceChanged
+      title: Saldo de la factura cambiado — autoridad de ledger-service
+      x-ce-type: com.receivables.ledger.invoice-balance-changed.v1
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        $ref: '#/components/schemas/InvoiceBalanceChangedPayload'
+      bindings:
+        $ref: '#/components/messageBindings/byInvoiceId'
+
+  schemas:
+    EventHeaders:
+      type: object
+      required: [ce_specversion, ce_id, ce_source, ce_type, ce_time, ce_tenantid, ce_correlationid]
+      properties:
+        ce_specversion:
+          type: string
+          const: '1.0'
+        ce_id:
+          type: string
+          format: uuid
+          description: Id único del mensaje (UUID v7); clave del inbox del consumidor.
+        ce_source:
+          type: string
+          examples: [/invoice-service]
+        ce_type:
+          type: string
+          examples: [com.receivables.invoice.issued.v1]
+        ce_time:
+          type: string
+          format: date-time
+        ce_subject:
+          type: string
+          examples: [invoice/0192f5d2-7c1a-7b3e-9f10-2a6c1d4e8b90]
+        ce_tenantid:
+          type: string
+          format: uuid
+        ce_correlationid:
+          type: string
+          description: Agrupa todos los mensajes de un mismo flujo (p. ej. una importación).
+        ce_causationid:
+          type: string
+          description: ce_id del mensaje que causó este.
+        traceparent:
+          type: string
+          description: Contexto W3C Trace Context.
+        content-type:
+          type: string
+          const: application/json
+
+    Uuid:
+      type: string
+      format: uuid
+    InvoiceVersion:
+      type: integer
+      minimum: 1
+      description: Versión del documento después del cambio (la del ledger no viaja en el evento).
+    Money:
+      type: object
+      additionalProperties: false
+      required: [amount, currency]
+      properties:
+        amount:
+          type: string
+          pattern: '^-?\d{1,15}(\.\d{1,4})?$'
+          description: Decimal exacto como cadena.
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+    Actor:
+      type: object
+      additionalProperties: false
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [HUMAN, AI, SYSTEM]
+        id:
+          type: string
+    SettlementStatus:
+      type: string
+      enum: [SETTLED, PARTIALLY_SETTLED, UNSETTLED]
+      description: Coincide letra por letra con el enum del schema Invoice de contracts/openapi/invoice-service.yaml.
+    AgingBucket:
+      type: string
+      enum: [CURRENT, D1_15, D16_30, D31_60, D61_90, D90_PLUS]
+      description: Coincide letra por letra con el enum agingBucket del schema Invoice de contracts/openapi/invoice-service.yaml.
+    ImportStatus:
+      type: string
+      enum: [PENDING, PROCESSING, COMPLETED, COMPLETED_WITH_ERRORS, FAILED]
+      description: Coincide letra por letra con el enum del schema ImportStatus de contracts/openapi/invoice-service.yaml.
+
+    InvoiceIssuedPayload:
+      type: object
+      additionalProperties: false
+      required: [invoiceId, version, customerId, total, issueDate, dueDate, actor]
+      properties:
+        invoiceId:
+          $ref: '#/components/schemas/Uuid'
+        version:
+          $ref: '#/components/schemas/InvoiceVersion'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        folio:
+          type: string
+          maxLength: 64
+        uuidCfdi:
+          type: string
+          description: UUID del CFDI 4.0 (si aplica).
+        total:
+          $ref: '#/components/schemas/Money'
+        issueDate:
+          type: string
+          format: date
+        dueDate:
+          type: string
+          format: date
+        actor:
+          $ref: '#/components/schemas/Actor'
+    InvoiceUpdatedPayload:
+      type: object
+      additionalProperties: false
+      required: [invoiceId, version, changedFields, actor]
+      properties:
+        invoiceId:
+          $ref: '#/components/schemas/Uuid'
+        version:
+          $ref: '#/components/schemas/InvoiceVersion'
+        changedFields:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            enum: [folio, dueDate]
+        actor:
+          $ref: '#/components/schemas/Actor'
+    InvoiceCancelledPayload:
+      type: object
+      additionalProperties: false
+      required: [invoiceId, version, reason, actor]
+      properties:
+        invoiceId:
+          $ref: '#/components/schemas/Uuid'
+        version:
+          $ref: '#/components/schemas/InvoiceVersion'
+        reason:
+          type: string
+          enum: [DUPLICATE, ERRONEOUS, NOT_DELIVERED, CUSTOMER_REQUEST, OTHER]
+        actor:
+          $ref: '#/components/schemas/Actor'
+    CreditNoteIssuedPayload:
+      type: object
+      additionalProperties: false
+      required: [invoiceId, creditNoteId, creditNoteVersion, customerId, amount, reason, issuedAt, actor]
+      properties:
+        invoiceId:
+          $ref: '#/components/schemas/Uuid'
+        creditNoteId:
+          $ref: '#/components/schemas/Uuid'
+        creditNoteVersion:
+          type: integer
+          minimum: 1
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        folio:
+          type: string
+          maxLength: 64
+        amount:
+          $ref: '#/components/schemas/Money'
+        reason:
+          type: string
+          enum: [DUPLICATE, ERRONEOUS_AMOUNT, RETURNED, SERVICE_NOT_DELIVERED, AGREEMENT, OTHER]
+        issuedAt:
+          type: string
+          format: date-time
+        actor:
+          $ref: '#/components/schemas/Actor'
+    InvoiceBecameOverduePayload:
+      type: object
+      additionalProperties: false
+      required: [invoiceId, dueDate, daysOverdue, becameOverdueAt]
+      properties:
+        invoiceId:
+          $ref: '#/components/schemas/Uuid'
+        dueDate:
+          type: string
+          format: date
+        daysOverdue:
+          type: integer
+          minimum: 1
+        becameOverdueAt:
+          type: string
+          format: date-time
+    InvoiceDueSoonPayload:
+      type: object
+      additionalProperties: false
+      description: Emitido por el tick diario por tenant, en la zona horaria del tenant.
+      required: [invoiceId, dueDate, daysUntilDue]
+      properties:
+        invoiceId:
+          $ref: '#/components/schemas/Uuid'
+        dueDate:
+          type: string
+          format: date
+        daysUntilDue:
+          type: integer
+          minimum: 0
+          maximum: 30
+    InvoiceAgingBucketChangedPayload:
+      type: object
+      additionalProperties: false
+      required: [invoiceId, from, to, changedAt]
+      properties:
+        invoiceId:
+          $ref: '#/components/schemas/Uuid'
+        from:
+          $ref: '#/components/schemas/AgingBucket'
+        to:
+          $ref: '#/components/schemas/AgingBucket'
+        changedAt:
+          type: string
+          format: date-time
+    InvoiceImportCompletedPayload:
+      type: object
+      additionalProperties: false
+      required: [importId, status, processed, failed, completedAt]
+      properties:
+        importId:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          $ref: '#/components/schemas/ImportStatus'
+        processed:
+          type: integer
+          minimum: 0
+        failed:
+          type: integer
+          minimum: 0
+        completedAt:
+          type: string
+          format: date-time
+    OrganizationSettingsChangedPayload:
+      type: object
+      additionalProperties: false
+      description: Propiedad de identity-service; invoice-service consume solo la zona horaria para su tick diario.
+      required: [organizationId, changedFields, changedAt]
+      properties:
+        organizationId:
+          $ref: '#/components/schemas/Uuid'
+        changedFields:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            enum: [timezone, locale, currency, contactPolicy]
+        timezone:
+          type: string
+          examples: [America/Mexico_City]
+          description: Zona horaria IANA del tenant, para el tick de vencimientos y antigüedad.
+        changedAt:
+          type: string
+          format: date-time
+    InvoiceBalanceChangedPayload:
+      type: object
+      additionalProperties: false
+      description: Solo lectura; el saldo es autoridad de ledger-service (Σ asignaciones + créditos ≤ total).
+      required: [invoiceId, customerId, balanceDue, paid, credits, settlementStatus, changedAt]
+      properties:
+        invoiceId:
+          $ref: '#/components/schemas/Uuid'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        balanceDue:
+          $ref: '#/components/schemas/Money'
+        paid:
+          $ref: '#/components/schemas/Money'
+        credits:
+          $ref: '#/components/schemas/Money'
+        settlementStatus:
+          $ref: '#/components/schemas/SettlementStatus'
+        changedAt:
+          type: string
+          format: date-time

@@ -1,0 +1,213 @@
+openapi: 3.1.0
+info:
+  title: integration-service API
+  version: 0.1.0
+  description: |
+    v0 — F2. Conexiones a ERP/sistemas contables, programación de
+    sincronización e importación de estados de cuenta. Capa anticorrupción
+    hacia sistemas externos (credenciales en Secrets Manager).
+    Llama a: invoice-service (POST /v1/invoice-imports), customer-service
+    (customers:batch-upsert), payment-service (POST /internal/v1/payments:import).
+    Publica: integration.events.v1 (SyncRunCompleted, SyncRunFailed).
+  contact:
+    name: Equipo Conversación e IA (dueño de integration-service)
+  license:
+    name: Propietario
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: http://integration.receivables.svc.cluster.local
+    description: Dentro del clúster (malla con mTLS)
+tags:
+  - name: Connections
+    description: Conexiones a sistemas externos
+  - name: SyncRuns
+    description: Ejecuciones de sincronización
+security:
+  - contextToken: []
+paths:
+  /v1/connections:
+    get:
+      operationId: listConnections
+      tags: [Connections]
+      summary: Lista conexiones configuradas
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Página de conexiones.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionPage'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+    post:
+      operationId: createConnection
+      tags: [Connections]
+      summary: Crea una conexión a un sistema externo
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConnectionCreate'
+      responses:
+        '201':
+          description: Conexión creada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Connection'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+
+  /v1/connections/{connectionId}/sync:
+    post:
+      operationId: runSync
+      tags: [SyncRuns]
+      summary: Lanza una sincronización
+      parameters:
+        - name: connectionId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202':
+          description: Sincronización en ejecución.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncRun'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/Conflict'
+
+  /v1/sync-runs/{runId}:
+    get:
+      operationId: getSyncRun
+      tags: [SyncRuns]
+      summary: Estado de una ejecución de sincronización
+      parameters:
+        - name: runId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+      responses:
+        '200':
+          description: Sincronización.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncRun'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    contextToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/contextToken'
+  parameters:
+    IdempotencyKey:
+      $ref: '../common/common.yaml#/components/parameters/IdempotencyKey'
+    Cursor:
+      $ref: '../common/common.yaml#/components/parameters/Cursor'
+    Limit:
+      $ref: '../common/common.yaml#/components/parameters/Limit'
+  schemas:
+    Uuid:
+      $ref: '../common/common.yaml#/components/schemas/Uuid'
+    PageInfo:
+      $ref: '../common/common.yaml#/components/schemas/PageInfo'
+    ConnectionType:
+      type: string
+      enum: [ERP, ACCOUNTING, BANK_STATEMENT]
+    Connection:
+      type: object
+      additionalProperties: false
+      required: [connectionId, type, status, createdAt]
+      properties:
+        connectionId:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          type: string
+          maxLength: 128
+        type:
+          $ref: '#/components/schemas/ConnectionType'
+        status:
+          type: string
+          enum: [ACTIVE, PAUSED, FAILED]
+        schedule:
+          type: string
+          description: Expresión cron de programación de sincronización.
+        lastSyncAt:
+          type: string
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+    ConnectionCreate:
+      type: object
+      additionalProperties: false
+      required: [type, name]
+      properties:
+        name:
+          type: string
+          maxLength: 128
+        type:
+          $ref: '#/components/schemas/ConnectionType'
+        schedule:
+          type: string
+        config:
+          type: object
+          additionalProperties: true
+          description: Parámetros de conexión (credenciales se resuelven de Secrets Manager).
+    ConnectionPage:
+      type: object
+      additionalProperties: false
+      required: [items, pageInfo]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Connection'
+        pageInfo:
+          $ref: '#/components/schemas/PageInfo'
+    SyncRun:
+      type: object
+      additionalProperties: false
+      required: [runId, connectionId, status, startedAt]
+      properties:
+        runId:
+          $ref: '#/components/schemas/Uuid'
+        connectionId:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          type: string
+          enum: [QUEUED, RUNNING, COMPLETED, FAILED]
+        importedCounts:
+          type: object
+          additionalProperties:
+            type: integer
+          description: Cuentas por tipo de registro importado.
+        error:
+          type: string
+          maxLength: 1000
+        startedAt:
+          type: string
+          format: date-time
+        finishedAt:
+          type: string
+          format: date-time

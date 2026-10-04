@@ -1,0 +1,307 @@
+openapi: 3.1.0
+info:
+  title: agreement-service API
+  version: 0.1.0
+  description: |
+    v0 — Promesas de pago, planes y cuotas, evaluación de cumplimiento y
+    temporizadores (recordatorio previo y verificación posterior al vencimiento).
+    Llama a policy-service /decisions/offer antes de crear o confirmar.
+    Si la política cambia entre el turno y la ejecución, agreement-service
+    evalúa con la vigente; si el resultado cambia, publica PromiseRejected y el
+    agente repite el turno con la versión nueva.
+    Publica: agreement.events.v1 (PromiseProposed, PromiseRejected,
+    PromiseConfirmed, PromiseReminderDue, PromiseFulfilled,
+    PromisePartiallyFulfilled, PromiseMissed, PromiseCancelled,
+    PromiseSuperseded).
+    Consume: ledger (PaymentAllocated, InvoiceBalanceChanged), invoice
+    (InvoiceCancelled), case (CaseClosed).
+    Comandos: agreement.commands.v1 (ProposePromise, ConfirmPromise) — con
+    permiso firmado.
+  contact:
+    name: Equipo Conversación e IA (dueño de agreement-service)
+  license:
+    name: Propietario
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: http://agreement.receivables.svc.cluster.local
+    description: Dentro del clúster (malla con mTLS)
+tags:
+  - name: Promises
+    description: Promesas de pago
+  - name: Internal
+    description: Rutas internas (mTLS + token de servicio)
+security:
+  - contextToken: []
+paths:
+  /v1/cases/{caseId}/promises:
+    get:
+      operationId: listPromises
+      tags: [Promises]
+      summary: Lista promesas de un caso
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/PromiseStatus'
+      responses:
+        '200':
+          description: Página de promesas.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PromisePage'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+    post:
+      operationId: createPromiseHuman
+      tags: [Promises]
+      summary: Propone una promesa (humano)
+      description: |
+        El humano propone una promesa; agreement-service consulta
+        policy-service /decisions/offer antes de aceptarla. Requiere
+        `Idempotency-Key`.
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PromiseCreate'
+      responses:
+        '201':
+          description: Promesa propuesta.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Promise'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/Conflict'
+
+  /v1/promises/{promiseId}/confirm:
+    post:
+      operationId: confirmPromise
+      tags: [Promises]
+      summary: Confirma una promesa (humano; reevalúa con política vigente)
+      description: |
+        Reevalúa con la política vigente. Si la decisión cambia respecto de la
+        propuesta, publica PromiseRejected en vez de confirmar.
+      parameters:
+        - $ref: '#/components/parameters/PromiseId'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Promesa confirmada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Promise'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/PreconditionFailed'
+
+  /v1/promises/{promiseId}/cancel:
+    post:
+      operationId: cancelPromise
+      tags: [Promises]
+      summary: Cancela una promesa
+      parameters:
+        - $ref: '#/components/parameters/PromiseId'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                reason:
+                  type: string
+                  maxLength: 500
+      responses:
+        '200':
+          description: Promesa cancelada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Promise'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/PreconditionFailed'
+
+  /internal/v1/cases/{caseId}/agreements:
+    get:
+      operationId: getCaseAgreements
+      tags: [Internal]
+      summary: Promesas y planes vigentes de un caso
+      x-internal: true
+      security:
+        - serviceToken: []
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+      responses:
+        '200':
+          description: Promesas y planes vigentes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseAgreements'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    contextToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/contextToken'
+    serviceToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/serviceToken'
+  parameters:
+    CaseId:
+      name: caseId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    PromiseId:
+      name: promiseId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    IdempotencyKey:
+      $ref: '../common/common.yaml#/components/parameters/IdempotencyKey'
+    IfMatch:
+      $ref: '../common/common.yaml#/components/parameters/IfMatch'
+    Cursor:
+      $ref: '../common/common.yaml#/components/parameters/Cursor'
+    Limit:
+      $ref: '../common/common.yaml#/components/parameters/Limit'
+  schemas:
+    Uuid:
+      $ref: '../common/common.yaml#/components/schemas/Uuid'
+    Money:
+      $ref: '../common/common.yaml#/components/schemas/Money'
+    PageInfo:
+      $ref: '../common/common.yaml#/components/schemas/PageInfo'
+    PromiseStatus:
+      type: string
+      enum: [PROPOSED, CONFIRMED, PARTIALLY_FULFILLED, FULFILLED, MISSED, CANCELLED, REJECTED, SUPERSEDED]
+    Offer:
+      type: object
+      additionalProperties: false
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [DISCOUNT, TERM, WAIVER, PARTIAL_PAYMENT]
+        discountPct:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 100
+        termDays:
+          type: integer
+          minimum: 0
+        amount:
+          $ref: '#/components/schemas/Money'
+    Promise:
+      type: object
+      additionalProperties: false
+      required: [promiseId, caseId, customerId, offer, dueDate, status, version]
+      properties:
+        promiseId:
+          $ref: '#/components/schemas/Uuid'
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        invoiceId:
+          $ref: '#/components/schemas/Uuid'
+        offer:
+          $ref: '#/components/schemas/Offer'
+        dueDate:
+          type: string
+          format: date
+        status:
+          $ref: '#/components/schemas/PromiseStatus'
+        policyVersion:
+          type: integer
+          minimum: 1
+        reminderAt:
+          type: string
+          format: date-time
+          description: Recordatorio previo al vencimiento.
+        verifyAfter:
+          type: string
+          format: date-time
+          description: Verificación posterior al vencimiento.
+        version:
+          type: integer
+          minimum: 1
+        createdAt:
+          type: string
+          format: date-time
+        confirmedAt:
+          type: string
+          format: date-time
+    PromiseCreate:
+      type: object
+      additionalProperties: false
+      required: [customerId, offer, dueDate]
+      properties:
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        invoiceId:
+          $ref: '#/components/schemas/Uuid'
+        offer:
+          $ref: '#/components/schemas/Offer'
+        dueDate:
+          type: string
+          format: date
+        reminderAt:
+          type: string
+          format: date-time
+    PromisePage:
+      type: object
+      additionalProperties: false
+      required: [items, pageInfo]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Promise'
+        pageInfo:
+          $ref: '#/components/schemas/PageInfo'
+    CaseAgreements:
+      type: object
+      additionalProperties: false
+      required: [caseId, promises]
+      properties:
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        promises:
+          type: array
+          items:
+            $ref: '#/components/schemas/Promise'

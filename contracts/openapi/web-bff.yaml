@@ -1,0 +1,174 @@
+openapi: 3.1.0
+info:
+  title: web-bff API
+  version: 0.1.0
+  description: |
+    v0 — Fachada de la app web (portal de cobranza). Compone respuestas de
+    case, ledger, agreement, conversation y tasks. Tiempo real por SSE.
+    No expone datos personales crudos; el BFF no escribe en dominios ajenos.
+    Autenticación: Bearer (JWT) emitido por identity-service; los campos
+    `userId`, `tenantId` y `roles` los firma identity-service.
+  contact:
+    name: Equipo Conversación e IA (dueño de web-bff)
+  license:
+    name: Propietario
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: http://web-bff.receivables.svc.cluster.local
+    description: Dentro del clúster (malla con mTLS)
+tags:
+  - name: Pages
+    description: Páginas compuestas (case-detail, inbox)
+  - name: Events
+    description: Streaming SSE por usuario/tenant
+security:
+  - contextToken: []
+paths:
+  /v1/pages/case-detail/{caseId}:
+    get:
+      operationId: getCaseDetailPage
+      tags: [Pages]
+      summary: Página de detalle de caso (compuesta)
+      description: |
+        Compone case-service, ledger-service, agreement-service,
+        conversation-service y task-service. El BFF no escribe en ninguno.
+      parameters:
+        - name: caseId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+      responses:
+        '200':
+          description: Página compuesta.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseDetailPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/events/stream:
+    get:
+      operationId: streamEvents
+      tags: [Events]
+      summary: SSE por usuario/tenant
+      description: |
+        Stream Server-Sent Events. El BFF consume eventos relevantes para la
+        UI (grupo bff-realtime en Kafka) y los re-emite como SSE.
+        `Content-Type: text/event-stream`.
+      parameters:
+        - name: Last-Event-ID
+          in: header
+          required: false
+          description: Último ce_id recibido; se re-sume desde ahí.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Stream SSE abierto.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+components:
+  securitySchemes:
+    contextToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/contextToken'
+  responses:
+    Unauthorized:
+      $ref: '../common/common.yaml#/components/responses/Unauthorized'
+    Forbidden:
+      $ref: '../common/common.yaml#/components/responses/Forbidden'
+    NotFound:
+      $ref: '../common/common.yaml#/components/responses/NotFound'
+  schemas:
+    Uuid:
+      $ref: '../common/common.yaml#/components/schemas/Uuid'
+    Money:
+      $ref: '../common/common.yaml#/components/schemas/Money'
+    CaseDetailPage:
+      type: object
+      additionalProperties: false
+      required: [caseId, status, version, agentMode, autonomyLevel, balance, promises, recentMessages, openTasks]
+      properties:
+        caseId:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          type: string
+          enum: [NEW, OUTREACH, AWAITING_REPLY, NEGOTIATING, PROMISE_ACTIVE, PLAN_ACTIVE, DISPUTED, ESCALATED, RESOLVED, CLOSED]
+        version:
+          type: integer
+          minimum: 1
+        agentMode:
+          type: string
+          enum: [AUTO, PAUSED, HUMAN_TAKEOVER]
+        autonomyLevel:
+          type: string
+          enum: [L0, L1, L2, L3]
+        balance:
+          $ref: '#/components/schemas/Money'
+        promises:
+          type: array
+          items:
+            $ref: '#/components/schemas/PromiseSummary'
+        recentMessages:
+          type: array
+          maxItems: 20
+          items:
+            $ref: '#/components/schemas/MessageSummary'
+        openTasks:
+          type: array
+          items:
+            $ref: '#/components/schemas/TaskSummary'
+    PromiseSummary:
+      type: object
+      additionalProperties: false
+      required: [promiseId, status, amount, promisedDate]
+      properties:
+        promiseId:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          type: string
+          enum: [PROPOSED, CONFIRMED, FULFILLED, PARTIALLY_FULFILLED, MISSED, CANCELLED, SUPERSEDED, REJECTED]
+        amount:
+          $ref: '#/components/schemas/Money'
+        promisedDate:
+          type: string
+          format: date
+    MessageSummary:
+      type: object
+      additionalProperties: false
+      required: [messageId, direction, body, sentAt]
+      properties:
+        messageId:
+          $ref: '#/components/schemas/Uuid'
+        direction:
+          type: string
+          enum: [INBOUND, OUTBOUND, INTERNAL]
+        body:
+          type: string
+          maxLength: 4096
+        sentAt:
+          type: string
+          format: date-time
+    TaskSummary:
+      type: object
+      additionalProperties: false
+      required: [taskId, type, status]
+      properties:
+        taskId:
+          $ref: '#/components/schemas/Uuid'
+        type:
+          type: string
+          examples: [APPROVAL, MANUAL_RECONCILIATION, UNKNOWN_NUMBER, ESCALATION, DISPUTE_REVIEW]
+        status:
+          type: string
+          enum: [OPEN, CLAIMED, CLOSED]

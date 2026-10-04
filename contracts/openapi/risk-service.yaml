@@ -1,0 +1,102 @@
+openapi: 3.1.0
+info:
+  title: risk-service API
+  version: 0.1.0
+  description: |
+    v0 — F2 heurístico · F3 ML. Dueño de features por cliente y scores
+    (propensión de pago, probabilidad de disputa, tiempo esperado de pago) con
+    versión de modelo y factores principales.
+    API interna: GET /internal/v1/customers/{customerId}/risk.
+    Consume: invoice · ledger · agreement · dispute.
+    Publica: risk.events.v1 (RiskScoreUpdated).
+    Batch: scoring nocturno; entrenamiento offline con registro de modelos (F3).
+  contact:
+    name: Equipo Conversación e IA (dueño de risk-service)
+  license:
+    name: Propietario
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: http://risk.receivables.svc.cluster.local
+    description: Dentro del clúster (malla con mTLS)
+tags:
+  - name: Risk
+    description: Scores de riesgo por cliente
+security:
+  - contextToken: []
+paths:
+  /internal/v1/customers/{customerId}/risk:
+    get:
+      operationId: getCustomerRisk
+      tags: [Risk]
+      summary: Score de riesgo actual de un cliente
+      x-internal: true
+      security:
+        - serviceToken: []
+      parameters:
+        - name: customerId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+      responses:
+        '200':
+          description: Score de riesgo.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RiskScore'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    contextToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/contextToken'
+    serviceToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/serviceToken'
+  schemas:
+    Uuid:
+      $ref: '../common/common.yaml#/components/schemas/Uuid'
+    RiskFactor:
+      type: object
+      additionalProperties: false
+      required: [name, contribution]
+      properties:
+        name:
+          type: string
+          maxLength: 128
+        contribution:
+          type: number
+          format: float
+    RiskScore:
+      type: object
+      additionalProperties: false
+      required: [customerId, paymentLikelihood, computedAt]
+      properties:
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        modelVersion:
+          type: string
+          maxLength: 128
+        paymentLikelihood:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          description: Propensión de pago.
+        disputeProbability:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          description: Probabilidad de disputa.
+        expectedPaymentDays:
+          type: integer
+          description: Tiempo esperado de pago (días).
+        factors:
+          type: array
+          items:
+            $ref: '#/components/schemas/RiskFactor'
+        computedAt:
+          type: string
+          format: date-time

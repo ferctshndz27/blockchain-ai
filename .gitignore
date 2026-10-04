@@ -1,13 +1,22 @@
-dependencias
+# dependencias
 node_modules/
-pycache/
+__pycache__/
 *.pyc
-secretos
+
+# secretos
 .env
 *.key
-salida / logs
+
+# salida / logs
 out/
 logs/
 *.log
-sistema
+
+# sistema
 .DS_Store
+
+# Wiki del arnés: nunca dentro del repositorio.
+/02-DOCS/
+
+# temporales del hook de lint de contratos (Hermes)
+contracts/.lint-tmp-*/

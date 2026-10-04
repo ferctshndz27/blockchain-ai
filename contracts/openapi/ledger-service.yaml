@@ -1,0 +1,466 @@
+openapi: 3.1.0
+info:
+  title: ledger-service API
+  version: 0.1.0
+  description: |
+    v0 — Libro auxiliar y conciliación. Dueño de las cuentas por factura
+    (proyección de total y moneda), pagos disponibles (proyección),
+    asignaciones (diario append-only), notas de crédito aplicadas, castigos,
+    diferencias cambiarias, el motor de conciliación y los SALDOS (autoridad
+    única).
+    Invariantes: Σ asignaciones ≤ monto del pago · Σ asignaciones + créditos ≤
+    total de la factura (ambas en una sola BD: por eso el ledger guarda
+    proyecciones de facturas y pagos).
+    Si un pago llega antes que su factura, queda UNMATCHED y el matching se
+    reintenta cuando llega InvoiceIssued.
+    Publica: ledger.events.v1 (PaymentAllocated, AllocationReversed,
+    InvoiceBalanceChanged, InvoiceSettled, PaymentUnmatched,
+    CustomerCreditBalanceChanged).
+    Consume: invoice (InvoiceIssued, InvoiceUpdated, InvoiceCancelled,
+    CreditNoteIssued), payment (PaymentConfirmed, PaymentReversed).
+  contact:
+    name: Equipo Conversación e IA (dueño de ledger-service)
+  license:
+    name: Propietario
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: http://ledger.receivables.svc.cluster.local
+    description: Dentro del clúster (malla con mTLS)
+tags:
+  - name: Ledger
+    description: Saldos por factura y movimientos
+  - name: Reconciliation
+    description: Conciliación y asignaciones manuales
+  - name: Internal
+    description: Rutas internas (mTLS + token de servicio)
+security:
+  - contextToken: []
+paths:
+  /v1/ledger/invoices/{invoiceId}:
+    get:
+      operationId: getInvoiceLedger
+      tags: [Ledger]
+      summary: Saldo y movimientos de una factura
+      parameters:
+        - $ref: '#/components/parameters/InvoiceId'
+      responses:
+        '200':
+          description: Saldo y movimientos de la factura.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvoiceLedger'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+  /v1/ledger/invoices/{invoiceId}/write-offs:
+    post:
+      operationId: createWriteOff
+      tags: [Ledger]
+      summary: "Registra un castigo (permiso específico)"
+      parameters:
+        - $ref: '#/components/parameters/InvoiceId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WriteOffCreate'
+      responses:
+        '201':
+          description: Castigo registrado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WriteOff'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/Conflict'
+
+  /v1/ledger/allocations/{allocationId}/reversal:
+    post:
+      operationId: reverseAllocation
+      tags: [Ledger]
+      summary: Revierte una asignación
+      parameters:
+        - name: allocationId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                reason:
+                  type: string
+                  maxLength: 500
+      responses:
+        '201':
+          description: Asignación revertida.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AllocationReversal'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/PreconditionFailed'
+
+  /v1/reconciliation/unmatched-payments:
+    get:
+      operationId: listUnmatchedPayments
+      tags: [Reconciliation]
+      summary: "Pagos sin casar: candidatos y diferencias"
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Pagos sin casar con candidatos.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnmatchedPaymentPage'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+
+  /v1/reconciliation/allocations:
+    post:
+      operationId: createManualAllocation
+      tags: [Reconciliation]
+      summary: "Asignación manual (Idempotency-Key, If-Match del pago)"
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AllocationCreate'
+      responses:
+        '201':
+          description: Asignación creada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Allocation'
+        '400':
+          $ref: '../common/common.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '409':
+          $ref: '../common/common.yaml#/components/responses/PreconditionFailed'
+
+  /internal/v1/customers/{customerId}/balances:
+    get:
+      operationId: getCustomerBalances
+      tags: [Internal]
+      summary: "Montos autoritativos de un cliente (para el agente)"
+      x-internal: true
+      security:
+        - serviceToken: []
+      parameters:
+        - name: customerId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+      responses:
+        '200':
+          description: Saldos autoritativos del cliente.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomerBalances'
+        '404':
+          $ref: '../common/common.yaml#/components/responses/NotFound'
+
+  /internal/v1/invoices:balances:
+    post:
+      operationId: batchInvoiceBalances
+      tags: [Internal]
+      summary: "Saldos autoritativos de varias facturas (lote)"
+      x-internal: true
+      security:
+        - serviceToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [invoiceIds]
+              properties:
+                invoiceIds:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items:
+                    $ref: '#/components/schemas/Uuid'
+      responses:
+        '200':
+          description: Saldos de las facturas.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [balances]
+                properties:
+                  balances:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/InvoiceBalance'
+        '401':
+          $ref: '../common/common.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: '../common/common.yaml#/components/responses/Forbidden'
+
+components:
+  securitySchemes:
+    contextToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/contextToken'
+    serviceToken:
+      $ref: '../common/common.yaml#/components/securitySchemes/serviceToken'
+  parameters:
+    InvoiceId:
+      name: invoiceId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    IdempotencyKey:
+      $ref: '../common/common.yaml#/components/parameters/IdempotencyKey'
+    IfMatch:
+      $ref: '../common/common.yaml#/components/parameters/IfMatch'
+    Cursor:
+      $ref: '../common/common.yaml#/components/parameters/Cursor'
+    Limit:
+      $ref: '../common/common.yaml#/components/parameters/Limit'
+  schemas:
+    Uuid:
+      $ref: '../common/common.yaml#/components/schemas/Uuid'
+    Money:
+      $ref: '../common/common.yaml#/components/schemas/Money'
+    PageInfo:
+      $ref: '../common/common.yaml#/components/schemas/PageInfo'
+    InvoiceBalance:
+      type: object
+      additionalProperties: false
+      required: [invoiceId, total, paid, balance, currency]
+      properties:
+        invoiceId:
+          $ref: '#/components/schemas/Uuid'
+        total:
+          $ref: '#/components/schemas/Money'
+        paid:
+          $ref: '#/components/schemas/Money'
+        creditApplied:
+          $ref: '#/components/schemas/Money'
+        balance:
+          $ref: '#/components/schemas/Money'
+        currency:
+          type: string
+        settled:
+          type: boolean
+    InvoiceLedger:
+      type: object
+      additionalProperties: false
+      required: [invoiceId, balance, movements]
+      properties:
+        invoiceId:
+          $ref: '#/components/schemas/Uuid'
+        balance:
+          $ref: '#/components/schemas/InvoiceBalance'
+        movements:
+          type: array
+          items:
+            $ref: '#/components/schemas/LedgerMovement'
+    LedgerMovement:
+      type: object
+      additionalProperties: false
+      required: [movementId, kind, amount, occurredAt]
+      properties:
+        movementId:
+          $ref: '#/components/schemas/Uuid'
+        kind:
+          type: string
+          enum: [ALLOCATION, REVERSAL, CREDIT_APPLIED, WRITE_OFF, FX_DIFFERENCE]
+        amount:
+          $ref: '#/components/schemas/Money'
+        currency:
+          type: string
+        reference:
+          type: string
+          description: Id del pago, nota de crédito o castigo asociado.
+        occurredAt:
+          type: string
+          format: date-time
+    Allocation:
+      type: object
+      additionalProperties: false
+      required: [allocationId, paymentId, invoiceId, amount, currency]
+      properties:
+        allocationId:
+          $ref: '#/components/schemas/Uuid'
+        paymentId:
+          $ref: '#/components/schemas/Uuid'
+        invoiceId:
+          $ref: '#/components/schemas/Uuid'
+        amount:
+          $ref: '#/components/schemas/Money'
+        currency:
+          type: string
+        kind:
+          type: string
+          enum: [AUTO, MANUAL]
+        createdAt:
+          type: string
+          format: date-time
+    AllocationReversal:
+      type: object
+      additionalProperties: false
+      required: [reversalId, allocationId, amount, currency]
+      properties:
+        reversalId:
+          $ref: '#/components/schemas/Uuid'
+        allocationId:
+          $ref: '#/components/schemas/Uuid'
+        amount:
+          $ref: '#/components/schemas/Money'
+        currency:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+    AllocationCreate:
+      type: object
+      additionalProperties: false
+      required: [paymentId, allocations]
+      properties:
+        paymentId:
+          $ref: '#/components/schemas/Uuid'
+        allocations:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            additionalProperties: false
+            required: [invoiceId, amount]
+            properties:
+              invoiceId:
+                $ref: '#/components/schemas/Uuid'
+              amount:
+                $ref: '#/components/schemas/Money'
+    UnmatchedPayment:
+      type: object
+      additionalProperties: false
+      required: [paymentId, amount, currency]
+      properties:
+        paymentId:
+          $ref: '#/components/schemas/Uuid'
+        amount:
+          $ref: '#/components/schemas/Money'
+        currency:
+          type: string
+        receivedAt:
+          type: string
+          format: date-time
+        candidates:
+          type: array
+          items:
+            $ref: '#/components/schemas/UnmatchedCandidate'
+    UnmatchedCandidate:
+      type: object
+      additionalProperties: false
+      required: [invoiceId, balance, difference]
+      properties:
+        invoiceId:
+          $ref: '#/components/schemas/Uuid'
+        balance:
+          $ref: '#/components/schemas/Money'
+        difference:
+          $ref: '#/components/schemas/Money'
+        score:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+    UnmatchedPaymentPage:
+      type: object
+      additionalProperties: false
+      required: [items, pageInfo]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/UnmatchedPayment'
+        pageInfo:
+          $ref: '#/components/schemas/PageInfo'
+    CustomerBalances:
+      type: object
+      additionalProperties: false
+      required: [customerId, totalBalance, creditBalance]
+      properties:
+        customerId:
+          $ref: '#/components/schemas/Uuid'
+        totalBalance:
+          $ref: '#/components/schemas/Money'
+        creditBalance:
+          $ref: '#/components/schemas/Money'
+        currency:
+          type: string
+        invoiceBalances:
+          type: array
+          items:
+            $ref: '#/components/schemas/InvoiceBalance'
+    WriteOff:
+      type: object
+      additionalProperties: false
+      required: [writeOffId, invoiceId, amount, reason, currency]
+      properties:
+        writeOffId:
+          $ref: '#/components/schemas/Uuid'
+        invoiceId:
+          $ref: '#/components/schemas/Uuid'
+        amount:
+          $ref: '#/components/schemas/Money'
+        currency:
+          type: string
+        reason:
+          type: string
+          maxLength: 500
+        approvedBy:
+          $ref: '../common/common.yaml#/components/schemas/Actor'
+        createdAt:
+          type: string
+          format: date-time
+    WriteOffCreate:
+      type: object
+      additionalProperties: false
+      required: [amount, reason]
+      properties:
+        amount:
+          $ref: '#/components/schemas/Money'
+        reason:
+          type: string
+          maxLength: 500
