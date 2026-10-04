@@ -68,6 +68,9 @@ components:
         contribution:
           type: number
           format: float
+        tenantId:
+          type: string
+
     RiskScore:
       type: object
       additionalProperties: false
